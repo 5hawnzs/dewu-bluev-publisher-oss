@@ -1,0 +1,2416 @@
+'use strict';
+/**
+ * ⑥ 模拟器发布
+ * PRD 要点：
+ *   - 发布节奏是人为间隔（60–120 秒/条），不是性能问题；2.5 小时里 93% 是在等间隔
+ *   - 失败可单独重跑；等重跑的时间不算人工
+ *   - 发布过程不占用发布单文件：结果追加写 jsonl，一批结束再合并回写 Excel
+ *   - 发布完还要回查审核状态（发完 ≠ 发出去了）
+ *
+ * 两种通道，区别必须一眼可见：
+ *   adb  —— 走真实命令（推图 + 媒体扫描 + uiautomator 定位 + 点击/输入），做的每一步都能在设备上看到；
+ *          UI 定位表（uiMap）没配好就直接失败并说明缺什么，**绝不报成功**。
+ *   mock —— 没有设备时的流程演练：节奏、重试、回写逻辑与真实一致，但状态明确标为模拟。
+ */
+const path = require('path');
+const fs = require('fs');
+const adb = require('./adb');
+const emulators = require('./emulators');
+const uimap = require('./uimap');
+const topicinput = require('./topicinput');
+const mediapermission = require('./mediapermission');
+const entrydialogs = require('./entrydialogs');
+const overlayguard = require('./overlayguard');
+// 转场模块：这里只用它的「分段编辑屏往前推一步」（advanceStage）与「唯一下一步」判据。
+const transitionSvc = require('./transition');
+const verifySvc = require('./verify');
+const albumready = require('./albumready');
+const store = require('../store');
+const sheet = require('./sheet');
+const wp = require('../util/winpath');
+
+const STEPS = ['上传图片…', '填标题正文', '填话题', '关联好物', '发布确认'];
+
+function cfg() { return store.get('publish') || {}; }
+
+// 得物拉起后会经历桌面横屏到应用竖屏的转场；连续读到相同尺寸才允许固定坐标点击。
+async function stableCoordinates(serial, screen, ctx = {}) {
+  const end = Date.now() + 6000;
+  // ★★ 2026-10-17 提速：把上一次已经确认过的尺寸**当作第一个样本**。
+  //   真机上每个 tapXY 步骤都要读一次屏幕尺寸，而「稳定」要求连续两次读到同一尺寸 ——
+  //   也就是每一步固定白读两次（实测 uiSize 一次 ~0.3-0.6s，一条内容五六个固定坐标步骤）。
+  //   拿上一次的结论当第一个样本后：尺寸没变 ⇒ 读一次就够；真转了屏 ⇒ 第一次读就与旧值不符，
+  //   stable 归 1、继续按老规矩等第二次相同读数，判据一点没放松。
+  let last = (ctx && ctx.uiSize && ctx.uiSize.known !== false && ctx.uiSize.w) ? ctx.uiSize : null;
+  let stable = last ? 1 : 0;
+  while (Date.now() < end) {
+    if (ctx.cancelled && ctx.cancelled()) throw new Error('发布已取消');
+    const live = await adb.uiSize(serial);
+    if (live.known) {
+      stable = last && last.w === live.w && last.h === live.h ? stable + 1 : 1;
+      last = live;
+      const mm = uimap.screenMismatch(screen, live);
+      if (stable >= 2 && !mm.mismatch) return live;
+      // 分辨率确实不同，且方向与表相同：等待旋转也无法修复，不再反复尝试。
+      if (stable >= 2 && mm.mismatch && screen && ((Number(screen.w) > Number(screen.h)) === live.landscape)) {
+        const error = new Error(`设备分辨率 ${live.w}×${live.h} 与定位表 ${screen.w}×${screen.h} 不匹配。请将 MuMu 调为定位表分辨率并核对 DPI，重启模拟器后重试，或重新制作本设备的定位表。`);
+        error.code = 'UI_COORDINATES';
+        throw error;
+      }
+    } else { stable = 0; last = null; }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  const error = new Error(last
+    ? `屏幕方向尚未稳定或与定位表不一致（当前 ${last.w}×${last.h}）。请关闭自动旋转，将得物保持在定位表方向后重试。`
+    : '无法读取设备屏幕尺寸，已停止发布。请重新连接模拟器后重试。');
+  error.code = 'UI_COORDINATES';
+  throw error;
+}
+
+/** 支持「还剩 N 秒」倒计时回调（真机日志：按 1 分钟间隔，57s 后执行） */
+function sleep(ms, cancelled, onTick) {
+  return new Promise(resolve => {
+    const end = Date.now() + ms;
+    let interval = null, timeout = null, settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      if (interval) clearInterval(interval);
+      if (timeout) clearTimeout(timeout);
+      resolve(value);
+    };
+    interval = setInterval(() => {
+      if (cancelled && cancelled()) { finish(false); return; }
+      if (onTick) onTick(Math.max(0, Math.ceil((end - Date.now()) / 1000)));
+    }, 1000);
+    timeout = setTimeout(() => finish(true), ms);
+  });
+}
+
+/**
+ * 取第一个「真正配过」的秒数，都没有就用最后一个兜底值。
+ * ★★ 为什么不能用 `c.intervalSec || c.intervalMinSec || 60`：
+ *    **0 是合法值**（0 = 连续发布，上一条发完直接发下一条），而 `0 || 60` 把它当成「没配」
+ *    ⇒ 用户在界面选了「连续发布」却仍然等 60 秒，且界面上查不出原因。
+ * ★ 顺带把字符串统一成数字：界面写回来的是字符串（`"0"`/`"60"`），
+ *   `"60" * 1000` 侥幸对，但 `a + gap` 那种加法会退化成字符串拼接（预计耗时就算错了）。
+ */
+function secOr(...vals) {
+  for (const v of vals) {
+    if (v === '' || v === null || v === undefined) continue;
+    const n = Number(v);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return 0;
+}
+
+/**
+ * 这一条发完、下一条开始之前要等多少秒。
+ * - 图文：用界面上的「发布间隔」（0 = 连续发布）。
+ * - 视频：`videoIntervalSec` **> 0 才生效**（单独放宽），否则跟随主间隔 ——
+ *   0 在视频这一项里的含义是「跟随」，不是「连续」，别混。
+ */
+function gapSecFor(kind, c) {
+  const base = secOr(c.intervalSec, c.intervalMinSec, 60);
+  if (kind !== 'video') return base;
+  const v = Number(c.videoIntervalSec);
+  return Number.isFinite(v) && v > 0 ? v : base;
+}
+
+/**
+ * 入口这一段的等待上限（毫秒）：默认 30 秒。
+ * 为什么要能改：它是「点击回执 ≠ 页面已切换」的兜底等待，回归里必须能压到亚秒级，
+ * 否则一条「入口没确认」的用例要白等 30 秒（重试一次就是 60 秒）。产品路径不写这个键 ⇒ 仍是 30 秒。
+ */
+function entryWaitMs() {
+  const n = Number(cfg().entryWaitMs);
+  return Number.isFinite(n) && n > 0 ? n : 30000;
+}
+
+/* ---------------- 设备（一个设备 = 一个账号） ---------------- */
+
+function devices() { return (cfg().devices) || []; }
+
+function addDevice({ name, serial }) {
+  const list = devices().slice();
+  if (!serial) throw new Error('缺少设备序列号');
+  if (list.some(d => d.serial === serial)) throw new Error('该设备已存在');
+  // id 不能只用 Date.now()：连续添加两台会撞同一毫秒，删除时会连坐
+  const dev = { id: 'dev' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name: name || serial, serial };
+  list.push(dev);
+  store.set({ publish: { devices: list } });
+  return dev;
+}
+
+function removeDevice(id) {
+  const list = devices().filter(d => d.id !== id);
+  store.set({ publish: { devices: list } });
+  return list;
+}
+
+/** 逐个探测在线状态；真机是多台雷电模拟器，一个设备对应一个账号 */
+async function listDevices() {
+  const list = devices();
+  const out = [];
+  for (const d of list) {
+    const p = await adb.probe(d.serial);
+    out.push({
+      id: d.id, name: d.name, serial: d.serial,
+      online: !!p.device, resolution: p.resolution, app: p.appPackage,
+      // 「装了这个 apk」与「它是不是当前输入法」是两件事，两个都回给界面 ——
+      // 中文能不能打进得物，只取决于后者。
+      adbKeyboard: p.adbKeyboard, adbKeyboardActive: p.adbKeyboardActive,
+      adbKeyboardCurrent: p.adbKeyboardCurrent, notes: p.notes
+    });
+  }
+  return out;
+}
+
+/**
+ * adb 现在认到的**全部**设备（含还没加进列表的）。
+ * ★ 为什么必须有这个：以前界面上的「检测在线」只逐个 probe 配置里那几台 —— 配置是空的时候
+ *   就永远列出空表，而自检的引导文案又写着「在下面的设备列表里点选用」，等于把用户指到一个
+ *   空列表上（2026-10-02 用户实测踩到）。有了它，界面可以把 adb 认到的设备直接列出来，
+ *   用户不必知道 emulator-5554 这种名字。
+ */
+async function scanDevices() {
+  const conf = devices();
+  const discovery = await emulators.connectDiscovered(adb, await emulators.discover());
+  const raw = discovery.raw.slice();
+  discovery.instances.forEach(v => {
+    if (v.serial && !raw.some(d => d.serial === v.serial)) raw.push({ serial: v.serial, state: v.state });
+  });
+  // 端口尚未出现的启动实例也返回给界面，不能伪装成“没有设备”。
+  const starting = discovery.instances.filter(v => !v.serial).map(v => ({
+    serial: '', state: 'starting', online: false, configured: false, name: v.name, detail: v.detail
+  }));
+
+  // ★ 2026-10-03 实测：MuMu 12 会把**同一台模拟器**同时暴露在 16384 / 5555 / 7555 三个端口上，
+  //   `adb devices` 里就是三行，界面上看着像「我明明只开了一个，怎么有两个序列号」。
+  //   判据（同一实例，实测三端口完全一致）：`settings get secure android_id` 相同
+  //   （本机 = 927145746ae845d6），`/proc/uptime` 也一致。
+  //   ⇒ 这里用 android_id 当身份，把同一身份的多个串合并成一台，只留一个主串。
+  //   读不到 android_id 的一律**不合并**（宁可多列，也不瞎合并成一台）。
+  const idOf = {};
+  await Promise.all(raw.filter(d => d.state === 'device').map(async d => {
+    try {
+      const r = await adb.shell(d.serial, 'settings get secure android_id', { timeout: 8000 });
+      const v = String((r && r.stdout) || '').trim();
+      if (/^[0-9a-f]{8,}$/i.test(v)) idOf[d.serial] = v;
+    } catch (e) { /* 读不到就当它是独立的一台 */ }
+  }));
+
+  const byId = {};
+  Object.keys(idOf).forEach(s => { (byId[idOf[s]] = byId[idOf[s]] || []).push(s); });
+  const dupOf = {};
+  const curSel = String((cfg().device) || '').trim();
+  Object.keys(byId).forEach(k => {
+    const ss = byId[k];
+    if (ss.length < 2) return;
+    // 主串优先级：已经加进列表的 > 当前正在用的 > 第一个
+    const main = ss.find(s => conf.some(x => x.serial === s))
+      || (curSel && ss.find(s => s === curSel))
+      || ss[0];
+    ss.forEach(s => { if (s !== main) dupOf[s] = main; });
+  });
+
+  return raw.map(d => {
+    const c = conf.find(x => x.serial === d.serial);
+    const main = dupOf[d.serial] || '';
+    return {
+      serial: d.serial, state: d.state, online: d.state === 'device',
+      configured: !!c, id: (c && c.id) || '', name: (c && c.name) || (discovery.instances.find(v => v.serial === d.serial) || {}).name || '',
+      detail: (discovery.instances.find(v => v.serial === d.serial) || {}).detail || '',
+      dupOf: main,   // 非空 = 这台跟主串是**同一台设备**，界面上不再单列
+      aliases: main ? [] : Object.keys(dupOf).filter(s => dupOf[s] === d.serial)
+    };
+  }).concat(starting, discovery.errors.length ? [{ serial: '', state: 'discovery-error', online: false, configured: false, name: '设备发现异常', detail: discovery.errors.join('；') }] : []);
+}
+
+function rand(a, b) { return Math.round(a + Math.random() * Math.max(0, b - a)); }
+
+/**
+ * 这条到底发视频还是图文。优先级：
+ *   发布行上的 kind（从「AI 内容报告」导入时按「内容类型」列判定好）→ 行上的内容类型原文 → 目录里实际有什么。
+ * 两样都有、又没标内容类型 → 返回 ''（判不了），由调用方明确报错 —— 绝不猜着发错内容。
+ */
+function rowKind(row, item = {}) {
+  const declared = (row && row.kind) || wp.contentKind(row && row.contentType);
+  if (declared === 'image' || declared === 'video') return declared;
+  const files = (item && item.files) || [];
+  const nImg = files.filter(f => f.type === 'image').length;
+  const nVid = files.filter(f => f.type === 'video').length;
+  if (nVid && !nImg) return 'video';
+  if (nImg) return 'image';
+  return '';
+}
+
+/* ---------------- 真实通道 ---------------- */
+
+async function connect(device) {
+  const c = cfg();
+  const list = devices();
+  const map = c.uiMap;
+  const hasMap = !!(map && map.steps && map.steps.length);
+  // ★★ 这里**绝不许**再兜底一个 'emulator-5554'（2026-10-02 删掉）：
+  //    没配设备时就该老实说「还没选设备」。原来那句硬编码兜底会拿一台不存在的设备去 probe，
+  //    界面报出来却是「你选的设备「emulator-5554」没连上」—— 用户以为程序里写死了一台假设备。
+  const serial = device || c.device || (list[0] && list[0].serial) || '';
+  if (!serial) {
+    return {
+      connected: false, mode: 'mock', device: '', probe: null, hasMap,
+      note: '还没选设备：到「设备管理」点「扫描设备」，从列出来的设备里点那一行的「加入并使用」—— 不用手填序列号。'
+    };
+  }
+  const p = await adb.probe(serial);
+  // ★★ 「能不能发布」**不许**拿「此刻这一屏抓不动」当判据（2026-10-03 修）：
+  //    得物发布页是**动画页**，uiautomator 抓不到是常态，程序本来就有 dumpsys 备用通道
+  //    （runStep 用的 dumpEx 会自动退过去）。原来这里把 tools.uiautomator 算进 ready ⇒
+  //    模拟器正停在发布页（＝要发布前的正常状态）时 ready=false ⇒ mode 被写成 'mock'
+  //    ⇒ 用户点「开始发布」一路「模拟成功」，模拟器里毫无动静。这就是「老是有那么多问题」的那个坑。
+  //    判据改成：设备在 + 能输入 + 认得出得物 + **两条抓取通道至少通一条**。
+  const canSee = !!(p.tools.uiautomator || p.tools.dumpsys);
+  const ready = !!(p.device && canSee && p.tools.input && p.appPackage);
+  const notes = p.notes.slice();
+  if (ready && !(map && map.steps && map.steps.length)) {
+    notes.push('还没配 UI 定位表（「设置 → 高级设置」→「抓取页面结构」→ 导入），配好前不会走真实通道'
+      + '；抓之前先把模拟器停在得物发布页 —— 推荐走底部「我」→ 右上角「主页」→「发布新动态」（3 跳，入口都带文字，稳）；也可以点动态流右上角那个没文字的相机图标（1 跳）');
+  }
+  return {
+    connected: ready,
+    mode: ready ? 'adb' : 'mock',
+    device: serial,
+    probe: p,
+    hasMap,
+    note: ready
+      ? `设备 ${serial} 在线（${p.resolution || '分辨率未知'}，得物 ${p.appPackage}）` + (map && map.steps ? ' · UI 定位表已就绪' : ' · 待配 UI 定位表')
+      : (p.adb ? '设备不满足真实发布条件，已切模拟通道：' + notes.join('；') : '未检测到 adb，已切模拟通道')
+  };
+}
+
+function failDir() { return path.join(store.get('paths.output'), 'failures'); }
+
+async function saveShot(serial, tag, ctx) {
+  try {
+    const buf = await adb.screencap(serial);
+    if (!buf || !buf.length) return null;
+    const dir = failDir();
+    await wp.mkdirp(dir);
+    const f = path.join(dir, `${tag}_${Date.now()}.png`);
+    await fs.promises.writeFile(wp.toLong(f), buf);
+    if (ctx && ctx.log) ctx.log(`已存失败截图 ${path.basename(f)}`, 'warn');
+    return f;
+  } catch (e) { return null; }
+}
+
+/**
+ * ★★ 屏幕守卫（whenOn / whenNotOn）—— 2026-10-03 加。
+ *
+ * 与 `when / whenNot` 的区别：那一套判的是**数据**（这一行填没填货号），
+ * 这一套判的是**当前这一屏长什么样**。真机上确实有「同一颗按钮落到哪一屏取决于 App 状态」
+ * 的情况，最典型的就是入口最后一跳被**草稿箱**接走（见 uimap.DEWU.draft）。
+ *
+ * 拿不到界面结构时**不许猜**：猜「大概不在草稿箱吧」的后果是漏点一步、然后卡在下一条，
+ * 而报错会指向下一条步骤（离真正的原因很远）—— 所以这里当场说清楚是哪一步、缺什么。
+ */
+async function screenGuard(serial, step, ctx, preferAnimOff, presetXml) {
+  const ids = String(step.whenOn || '').split(',').map(s => s.trim()).filter(Boolean)
+    .concat(String(step.whenNotOn || '').split(',').map(s => s.trim()).filter(Boolean));
+  // ★★ 2026-10-04 提速实测：守卫的 dump 原来默认 `retries:1`（失败多等一轮），
+  //   而相册页这类「永不 idle」的屏每轮要白等 ~11s（实测 11.4s/次）⇒ 一条内容里几个守卫步
+  //   叠加起来就是几十秒的纯等待（用户投诉「整体速度为什么那么慢」）。
+  //   ⇒ 守卫**不重试**（retries:0），并把「这一屏要不要关动画」交给**按步骤名学习**的缓存：
+  //     同一个步骤名（定位表里写死的，不随数据变）第一次撞上就关动画抓、抓完记下来，
+  //     后面每一条内容的同一步直接走「关动画」路径（实测关动画后 ~2s 就能抓到）。
+  // ★★ 2026-10-17 提速（用户口径「减少重复观测」）：上一步被守卫跳过 = 一个像素都没碰，
+  //   这一屏的结构从那一刻起没变过 ⇒ 直接用它，不再抓第二次（一次 dump 真机 ~1-2s）。
+  //   只有「跳过」的那一步会把结构交给下一步（runReal 的 carryXml），有动作的步骤一律重新抓。
+  const d = (typeof presetXml === 'string' && presetXml)
+    ? { ok: true, xml: presetXml, why: '', via: 'reuse', animOff: false }
+    : await mediapermission.dump(serial, { pkg: uimap.DEWU.pkg, retries: 0, preferAnimOff: !!preferAnimOff }, ctx);
+  if (!d.ok) {
+    // ★★ 2026-10-04：**已经决定要抛错了**，这时候才附带一句「设备在不在线」——
+    //   设备掉线时那串「dump 没有任何输出 / 备用通道也跑不起来」会把排查带偏到「页面不 idle」上，
+    //   而真因是设备掉了（处置完全不同：重连 / 重启模拟器）。
+    //   ★ 只在**这一条报错路径**上调，成功路径一个字节都不变（也免得污染调用序列）。
+    const hint = await adb.offlineHint(serial);
+    throw new Error(`「${step.name || step.value}」这一步要先看当前这一屏有没有 `
+      + `${ids.join(' / ')}，但拿不到界面结构：${d.why}${hint}`);
+  }
+  if (d.via === 'dumpsys' && ctx && ctx.log) {
+    ctx.log('屏幕守卫走的是 dumpsys 备用通道（只有 id / 坐标，没有文字）', 'warn');
+  }
+  const g = uimap.screenCondOk(step, uimap.parseNodes(d.xml));
+  if (!g.ok && ctx && ctx.log) ctx.log(`屏幕守卫拦下这一步：${g.why}`, 'info');
+  // ★★ 2026-10-04 提速（用户投诉「选择素材太慢」的直接来源）：
+  //   「这一屏不 idle」是**屏幕的性质**，与「守卫条件成不成立」无关 —— 所以**在成功和失败两条
+  //   路径上都要把它学下来**。原来只在成功路径记（runStep 里 `if (g.ok)` 之后），而弹窗守卫
+  //   （「未完成草稿拦截 · 点放弃」）绝大多数情况下**条件不成立 ⇒ 直接 return skipped**，
+  //   于是每一条内容走到这一步都要**重新白等一次 idle 超时**。真机实测：该步每条 **13.5s**，
+  //   而这 13.5s 里没有任何有效动作（就是在等一个永远不来的 idle）。
+  //   ⇒ 只要 dump 这次是**关着动画**才抓到的（`d.animOff`），当场记进按步骤名共享的缓存。
+  if (d.animOff && ctx && ctx.animOffSteps && step.name && !ctx.animOffSteps[step.name]) {
+    ctx.animOffSteps[step.name] = true;
+    if (ctx.log) {
+      ctx.log('页面一直不 idle，已临时关掉系统动画抓到结构（抓完已还原）；'
+        + '本批后面再遇到这一步就直接走关动画，不再白等那 ~11 秒', 'warn');
+    }
+  }
+  // ★ 2026-10-03 提速：把刚抓到的那份结构**带回去**给同一步的点击用（见 runStep 的 reusedXml）。
+  //   一个守卫步原来要抓两次屏（守卫一次 + tapId 一次，实测 ~2×1-2s），现在只抓一次。
+  // ★★ 2026-10-04：把 `animOff`（这一屏抓的时候是不是关着动画）也带回去 ⇒ runStep 把它记进
+  //   `animOffSteps[stepKey]`，下一条内容走到同一步就不用再撞一次。
+  return Object.assign({}, g, { xml: d.xml, animOff: !!d.animOff });
+}
+
+/** 这一屏的屏幕范围（取所有可见节点里最大的右下角） */
+function screenOf(nodes) {
+  return (nodes || []).reduce((a, n) => {
+    const b = n.box;
+    if (!b || b.x2 <= b.x1 || b.y2 <= b.y1) return a;
+    return { w: Math.max(a.w, b.x2), h: Math.max(a.h, b.y2) };
+  }, { w: 0, h: 0 });
+}
+
+/**
+ * 弹窗外侧的一个点：居中弹窗 ⇒ 点它正上方的遮罩；认不出居中那块 ⇒ 点屏幕上方 8% 处。
+ * 遮罩节点自己的 clickable 经常是 false（真正可点的是它的子容器），所以不能拿它当
+ * 「能不能点外侧」的条件；这里只负责找一个**弹窗之外**的坐标。
+ */
+function outsidePoint(nodes, overlay, camera) {
+  const screen = screenOf(nodes);
+  const box = n => (n && n.box && n.box.x2 > n.box.x1 && n.box.y2 > n.box.y1) ? n.box : null;
+  const ob = box(overlay);
+  if (!ob) return null;
+  const covers = (b, p) => !!(b && p && b.x1 <= p.x && p.x <= b.x2 && b.y1 <= p.y && p.y <= b.y2);
+  const area = (ob.x2 - ob.x1) * (ob.y2 - ob.y1);
+  // 取居中的最大内层容器，不要取最后一个文字节点：后者常常只是弹窗内部的一行字，
+  // 在它旁边点一下仍然落在弹窗里面，等于没关。
+  const inner = (nodes || []).filter(n => {
+    const b = box(n);
+    if (!b || n === overlay) return false;
+    return Math.abs((b.x1 + b.x2) / 2 - screen.w / 2) < screen.w * 0.2
+      && (b.x2 - b.x1) * (b.y2 - b.y1) < area * 0.9
+      && !covers(b, camera && camera.center);
+  }).sort((a, b) => {
+    const aa = (a.box.x2 - a.box.x1) * (a.box.y2 - a.box.y1);
+    const bb = (b.box.x2 - b.box.x1) * (b.box.y2 - b.box.y1);
+    return bb - aa;
+  })[0];
+  const x = Math.round(screen.w / 2);
+  if (inner) {
+    const b = inner.box;
+    return [
+      { x, y: b.y1 > 60 ? b.y1 - 30 : Math.min(screen.h - 10, b.y2 + 30) },
+      { x, y: Math.round(screen.h * 0.08) }
+    ];
+  }
+  return [
+    { x, y: Math.round(screen.h * 0.08) },
+    { x: Math.round(screen.w * 0.08), y: Math.round(screen.h * 0.5) }
+  ];
+}
+
+/**
+ * 遮罩关不掉时留给云端的证据。
+ *
+ * 只记录“看得见、认得出”的控件属性，不写整棵 XML（里面常有账号、私信、商品标题）。
+ * 字段限长，保证 reason / 云日志字段不会被一条异常界面撑爆。
+ */
+function overlayEvidence(nodes, overlay, target) {
+  const visible = n => !!(n && n.box && n.box.x2 > n.box.x1 && n.box.y2 > n.box.y1);
+  const text = n => String((n && (n.text || n.desc)) || '').replace(/\s+/g, ' ').trim();
+  const clip = (s, n) => {
+    const v = String(s || '');
+    return v.length > n ? v.slice(0, Math.max(0, n - 1)) + '…' : v;
+  };
+  // 系统权限/输入法的遮罩同样可能挡住得物；只保留可见且有文字/资源 id 的节点。
+  const own = (nodes || []).filter(n => visible(n)
+    && (text(n) || /:id\//.test(String(n.id || ''))));
+  const cover = own.find(n => n === overlay) || overlay;
+  // 先在遮罩范围内找弹窗内容与按钮，避免把动态流里别处的帖子文字当成本次弹窗。
+  const inCover = n => {
+    if (!visible(n) || n === cover || !cover || !cover.box) return false;
+    const b = n.box, o = cover.box;
+    return b.x1 >= o.x1 && b.y1 >= o.y1 && b.x2 <= o.x2 && b.y2 <= o.y2;
+  };
+  const inside = own.filter(inCover);
+  // 优先取遮罩容器里的可见按钮；数量固定，避免整页正文把原因撑长。
+  const buttons = inside.filter(n =>
+    n.clickable || /(?:^|:id\/)(?:btn|button|iv_?close|tvCancel|tv_?close|close)/i.test(String(n.id || '')))
+    .slice(0, 6)
+    .map(n => `${clip(text(n) || '无文字', 18)}${n.clickable ? '·可点' : '·不可点'}`
+      + `(${clip(n.id || n.cls || '无id', 42)},${clip(n.bounds || '-', 28)})`);
+  const content = inside.filter(n => text(n)).slice(0, 8).map(n => clip(text(n), 28));
+  // 没有可点容器并不等于没有按钮：得物常把 clickable 放在文字节点上，也可能只给出按钮 id。
+  const namedButtons = inside.filter(n => text(n)
+    && /^(?:取消|关闭|知道了|我知道了|暂不|以后再说|稍后再说|确定|好的|下次再说|跳过)$/.test(text(n)));
+  const bounds = cover && cover.box ? `[${cover.box.x1},${cover.box.y1}][${cover.box.x2},${cover.box.y2}]`
+    : String((cover && cover.bounds) || '-');
+  const pkg = clip((cover && cover.pkg) || '-', 48);
+  const id = clip((cover && (cover.id || cover.cls)) || '无id', 64);
+  const targetAt = target && target.center ? `${target.center.x},${target.center.y}` : '-';
+  return clip(`遮罩=${pkg}/${id}${bounds}; 目标=${targetAt}; 文字=${content.join(' / ') || '无可读文字'}; `
+    + `按钮=${buttons.join(' / ') || namedButtons.slice(0, 4).map(n =>
+      `${clip(text(n), 18)}${n.clickable ? '·可点' : '·不可点'}(${clip(n.id || n.cls || '无id', 42)},`
+      + `${clip(n.bounds || '-', 28)})`).join(' / ') || '无按钮'}`, 420);
+}
+
+function visibleTextOf(nodes) {
+  return (nodes || []).filter(n => n && n.text).slice(0, 10).map(n => n.text).join(' / ');
+}
+
+/**
+ * 没找到目标时，如果页面上有明确弹层，要先把“找不到”变成“被什么挡住”。
+ * 旧行为只抛“当前可见文本：活动弹窗 / 关闭”，云端无法判断这是可关闭弹窗
+ * 还是控件布局变化，也没法据此补点击规则。
+ */
+function blockedTargetError(nodes, step) {
+  return overlayguard.blockedError(nodes, step);
+}
+
+/**
+ * 普通定位步骤（tapId / tapText / tapDesc / tapCardText）的可点击遮罩。
+ *
+ * 这里只认“真正压在目标点击点上方、且属于当前页面绘制顺序之后”的节点：
+ *   · 动态流自己的 RecyclerView / refreshLayout 在目标之前，不是遮罩；
+ *   · 目标自己的子节点（文本、图标）虽然可能在目标之后，但其 bounds 在目标框内，也不是遮罩；
+ *   · 居中弹窗、活动弹窗、系统提示通常在全屏 scrim 之后，且提供明确关闭按钮。
+ * 有明确关闭按钮就点关闭；没有明确按钮时才按现有安全规则点一次外侧，
+ * 绝不对目标做盲点。调用方复用当前这屏的 nodes，不额外抓屏，因此正常路径不增加耗时。
+ */
+function stepOverlayOf(nodes, target) {
+  return overlayguard.overTarget(nodes, target);
+}
+
+/**
+ * 弹窗/遮罩与目标是否同时存在于这一屏。
+ *
+ * 这是“先清弹窗、再找目标”的判据：有些弹窗会把底下的目标节点从 dump 中暂时遮掉，
+ * 如果只等目标出现，就会把一屏可关闭的弹窗误报成“找不到控件”。这里只认明确弹窗，
+ * 绝不把普通页面容器当遮挡；清理后仍复用下一次正常观察，不额外增加一条成功路径。
+ */
+function blockingModal(nodes) {
+  return overlayguard.blocking(nodes);
+}
+
+/** 关掉当前步骤看见的明确遮罩；没有遮罩或无法安全关闭 ⇒ false。 */
+async function clearStepOverlay(serial, nodes, ctx, target, step) {
+  return overlayguard.dismiss(serial, nodes, ctx, step, target);
+}
+
+async function clearBlockingModal(serial, nodes, ctx, step) {
+  const modal = blockingModal(nodes);
+  if (!modal) return false;
+  const target = modal.button && modal.button.center ? modal.button : modal.node;
+  return overlayguard.dismiss(serial, nodes, ctx, step, target);
+}
+
+// 商家主页可能没有 tvGoHomePage；使用首页动态流的相机入口，不依赖账号主页布局。
+// 相机是先点后判：点「动态」后紧接着点实测坐标；两次点击之间不读屏、不等待。
+async function tapReadyCamera(serial, ctx) {
+  if (ctx.cancelled && ctx.cancelled()) throw new Error('发布已取消');
+  const point = { x: 1026, y: 81 };
+  const result = await adb.tap(serial, point.x, point.y);
+  if (!result.ok) {
+    const error = new Error('相机点击命令失败，未确认进入发布流程');
+    error.code = 'PUBLISH_ENTRY_UNCONFIRMED';
+    throw error;
+  }
+  ctx.cameraTapPoint = point;
+  if (ctx.log) ctx.log(`备用入口：动态流已确认，先点击相机 (${point.x},${point.y})，再判断是否进入发布流程`, 'info');
+}
+
+async function openPublishEntry(serial, ctx = {}) {
+  const uploadWaitMs = Math.max(2000, (Number(cfg().uploadWaitSec) > 0 ? Number(cfg().uploadWaitSec) : 180) * 1000);
+  const home = await adb.ensureApp(serial, {
+    pkg: uimap.DEWU.pkg, activity: uimap.DEWU.launchActivity, want: uimap.DEWU.homeActivity,
+    judge: f => uimap.isHomeScreen(f), timeoutMs: 30000, allowForceStop: false,
+    onNote: m => { if (ctx.log) ctx.log(m, 'warn'); },
+    uploadWaitMs
+  });
+  if (!home.ok) throw new Error('无法返回得物首页：' + (home.why || '未知原因'));
+  // 点「动态」和点相机之间没有任何页面读取：两个坐标都来自 1080×1920 真机实测。
+  // 这里的“两击”是动态页签 + 相机各一次；相机点完先观察，已跳转就绝不补点。
+  // 入口弹窗只能在首击相机之后观察和恢复；首击前预检会把正常动态流误判成遮挡。
+  if (ctx.cancelled && ctx.cancelled()) throw new Error('发布已取消');
+  const trendTap = await adb.tap(serial, 135, 1869);
+  if (!trendTap.ok) {
+    const error = new Error('动态页签点击命令失败；未点击相机、未进入发布流程。');
+    error.code = 'PUBLISH_ENTRY_UNCONFIRMED';
+    throw error;
+  }
+  await tapReadyCamera(serial, ctx);
+  // 只点击一次，慢设备允许继续转场；命令回执不代表页面已进入。
+  const started = performance.now(), timeoutMs = entryWaitMs();
+  let focus = '', lastKnownFocus = '', warned = false;
+  let cameraRetried = false, cameraRecoveryAt = 0, cameraWaitForOverlayClose = false;
+  let cameraRecoveryBlocked = false;
+  const cameraTapAt = performance.now();
+  while (performance.now() - started < timeoutMs) {
+    if (ctx.cancelled && ctx.cancelled()) throw new Error('发布已取消');
+    const remaining = Math.max(1, timeoutMs - (performance.now() - started));
+    focus = await adb.currentFocus(serial, { timeout: Math.min(3000, Math.ceil(remaining)) });
+    if (ctx.cancelled && ctx.cancelled()) throw new Error('发布已取消');
+    if (focus) lastKnownFocus = focus;
+    if (uimap.isPublishScreen(focus) || uimap.isDraftScreen(focus)) {
+      ctx.publishEntryReady = true;
+      ctx.publishEntryRoute = 'camera';
+      if (ctx.log) ctx.log('已通过动态流相机进入发布流程，跳过账号主页入口', 'info');
+      return { ok: true, focus };
+    }
+  // ★★ 2026-10-18 用户口径：相机先点，页面没走才判定；有关闭遮罩就关掉，
+  //   页面确实仍停在动态流才补点一次。正常加载会先转场到相册；只有加载结束、
+  //   页面确实仍留在动态流时才进入恢复。
+    if (!cameraRetried && !cameraRecoveryBlocked && ctx.cameraTapPoint
+      && focus && uimap.isDewuFocus(focus)
+      && performance.now() - cameraTapAt >= 3000) {
+      if (cameraWaitForOverlayClose) {
+        // 相机首击后发现了遮罩；先关闭，再让循环从干净页面重新判断。
+        // 同一轮不能补点，否则关闭动作尚未落地时相机会再次点到遮罩上。
+        try {
+          const recovery = await recoverCameraAfterTap(serial, ctx);
+          if (recovery.status === 'retried') {
+            cameraRetried = true;
+            cameraRecoveryAt = performance.now();
+          } else if (recovery.status === 'overlay-cleared') {
+            // 弹窗刚关掉，下一轮必须继续恢复并补点；不能把等待状态清掉。
+            cameraWaitForOverlayClose = true;
+            continue;
+          } else if (recovery.status === 'loading' || recovery.status === 'unsafe-waiting') {
+            // 正常加载/上传态不是“点击失败”。继续等它自行结束；这期间绝不能
+            // 把等待状态清掉，否则下一轮会再次进入恢复并补点相机。
+            cameraWaitForOverlayClose = true;
+            cameraRecoveryAt = cameraTapAt;
+            continue;
+          }
+          cameraWaitForOverlayClose = false;
+        } catch (error) {
+          if (error.code !== 'PUBLISH_OVERLAY_UNCLOSED') throw error;
+          if (ctx.log) ctx.log('备用入口：' + error.message, 'warn');
+          cameraWaitForOverlayClose = false;
+          cameraRecoveryBlocked = true;
+        }
+      } else if (!cameraRetried) {
+        try {
+          const recovery = await recoverCameraAfterTap(serial, ctx);
+          if (recovery.status === 'retried') {
+            // recoverCameraAfterTap 已经完成了唯一一次补点；这里直接进入终态，
+            // 不再等待下一轮“处理遮挡后补点”，否则会发出第三次相机点击。
+            cameraRetried = true;
+            cameraRecoveryAt = performance.now();
+            if (ctx.log) ctx.log('备用入口：相机首击后仍未进入发布流程，已补点一次并继续观察', 'info');
+          } else if (recovery.status === 'overlay-cleared') {
+            // 这一轮才识别到遮罩：保持未补点状态，下一轮先确认干净页再补点。
+            cameraWaitForOverlayClose = true;
+            if (ctx.log) ctx.log('备用入口：已关闭遮挡，重新确认页面后再补点相机', 'info');
+          }
+        } catch (error) {
+          if (error.code !== 'PUBLISH_OVERLAY_UNCLOSED') throw error;
+          if (ctx.log) ctx.log('备用入口：' + error.message, 'warn');
+          cameraRecoveryBlocked = true;
+        }
+      }
+    }
+    if (!warned && performance.now() - started >= 8000) {
+      warned = true;
+      if (ctx.log) ctx.log(`备用入口跳转较慢，继续等待页面确认（最多 ${Number((timeoutMs / 1000).toFixed(1))} 秒，不重复点击相机）`, 'info');
+    }
+    await sleep(Math.min(300, Math.max(0, timeoutMs - (performance.now() - started))), ctx.cancelled);
+  }
+  const observed = !focus ? '当前前台页面读不到' : uimap.isHomeScreen(focus)
+    ? '当前仍在得物首页，无法区分点击未生效还是跳转卡顿'
+    : `当前停在其他页面「${focus}」，可能被弹窗或其他应用阻挡`;
+  const retryNote = cameraRetried
+    ? `（已判定并补点一次${cameraRecoveryAt ? `，补点后观察 ${((performance.now() - cameraRecoveryAt) / 1000).toFixed(1)}s` : ''}）`
+    : '';
+  const error = new Error(`已点击动态流相机，等待 ${Number((timeoutMs / 1000).toFixed(1))} 秒仍未确认进入相册或草稿箱${retryNote}；${observed}`
+    + (!focus && lastKnownFocus ? `；此前最后读到「${lastKnownFocus}」，不作为当前页面` : '')
+    + '。未选图、未提交；本条按失败处理，请查看设备页面或失败截图。');
+  error.code = 'PUBLISH_ENTRY_UNCONFIRMED';
+  throw error;
+}
+
+async function recoverCameraAfterTap(serial, ctx) {
+  const d = await mediapermission.dump(serial, { pkg: uimap.DEWU.pkg, retries: 0 }, ctx);
+  if (ctx.cancelled && ctx.cancelled()) throw new Error('发布已取消');
+  if (!d.ok) return { status: 'unreadable' };
+  const nodes = uimap.parseNodes(d.xml);
+  // 加载层可能只覆盖动态流的一部分（没有 Dialog、也不压在相机坐标上）。
+  // 相机首击失败后的恢复只能等它结束，绝不能把“还在加载”当成“相机没点上”。
+  if (entrydialogs.hasNormalLoading(nodes)) {
+    if (ctx.log) ctx.log('备用入口：相机点击后页面仍在正常处理，继续等待，不补点', 'info');
+    return { status: 'loading' };
+  }
+  if (entrydialogs.hasUploadInFlight(nodes)) {
+    if (ctx.log) ctx.log('备用入口：相机首击后页面涉及上传/发布，继续等待，不关闭弹窗、不补点', 'info');
+    return { status: 'unsafe-waiting' };
+  }
+  const dialog = entrydialogs.inspect(nodes);
+  if (dialog) {
+    const dismissEntryDialog = async (name) => {
+      const target = { center: dialog.button.center };
+      const cleared = await overlayguard.dismiss(serial, nodes, ctx, { name }, target);
+      if (cleared) return true;
+      // Some real Dewu prompts use an unclassified popup container. They are
+      // discovered by entrydialogs.inspect(), but not by overlayguard's explicit
+      // Dialog/PopupWindow detector. Bound those retries here as well.
+      const key = `${name}|${dialog.button.bounds || ''}|${dialog.button.center.x},${dialog.button.center.y}`;
+      const attempts = ctx._cameraDialogDismiss || (ctx._cameraDialogDismiss = { key: '', tries: 0, at: 0 });
+      if (attempts.key !== key) {
+        attempts.key = key;
+        attempts.tries = 0;
+        attempts.at = 0;
+      }
+      if (attempts.tries >= 2) {
+        const error = overlayguard.unclosedError({ name }, {
+          name: dialog.name || name,
+          container: dialog.container || dialog.node || dialog.button
+        });
+        error.message += '；已有限重试 2 次，未继续补点相机';
+        throw error;
+      }
+      const waitMs = attempts.tries && attempts.at ? 700 - (Date.now() - attempts.at) : 0;
+      if (waitMs > 0) await sleep(waitMs, ctx.cancelled);
+      attempts.tries++;
+      attempts.at = Date.now();
+      const result = await adb.tap(serial, dialog.button.center.x, dialog.button.center.y);
+      if (!result.ok) {
+        const error = new Error(`相机首击后关闭「${dialog.name || name}」失败；未继续补点相机。`);
+        error.code = 'PUBLISH_ENTRY_UNCONFIRMED';
+        throw error;
+      }
+      if (ctx.log) ctx.log(`备用入口：已关闭${name}，重新确认页面后再补点相机`, 'info');
+      await sleep(300, ctx.cancelled);
+      return true;
+    };
+    if (dialog.resume && dialog.button && dialog.button.center) {
+      if (await dismissEntryDialog('未完成内容提示')) return { status: 'overlay-cleared' };
+    }
+    if (dialog.button && dialog.button.center) {
+      if (await dismissEntryDialog('入口弹窗')) return { status: 'overlay-cleared' };
+    }
+  }
+  if (overlayguard.loadingOverTarget(nodes, ctx.cameraTapPoint)) {
+    if (ctx.log) ctx.log('备用入口：相机点击后页面仍在正常处理，继续等待，不补点', 'info');
+    return { status: 'loading' };
+  }
+  const camera = nodes.find(n => n.id === uimap.DEWU.entryId && n.enabled && n.center);
+  // 相机消失不等于已经进入发布流程：页面也可能在动态流内切换、被别的应用
+  // 短暂盖住，或仍在转场。必须由调用方的前台确认进入发布/草稿页；
+  // 这里只负责“仍在首页且相机还在”的补点。没有相机时返回 false，让调用方继续
+  // 轮询前台，而不是把本次入口提前判成功。
+  if (!camera) return { status: 'awaiting-camera' };
+  // 恢复补点必须使用入口固定坐标；dump 节点中心只用于确认相机仍在。
+  const target = { center: ctx.cameraTapPoint || { x: 1026, y: 81 } };
+  const cleared = await overlayguard.dismiss(serial, nodes, ctx, { name: '备用入口 · 相机' }, target);
+  // 关掉遮罩后必须先回到外层重新确认页面已经干净。不能在同一轮里立刻补点：
+  // 关闭动作刚发出时弹窗可能还没消失，这一击会被弹窗吞掉，外层又会把
+  // “仍在首页”当成未点击，形成多次关闭/补点的假象。
+  if (cleared) {
+    ctx.cameraWaitForOverlayClose = true;
+    return { status: 'overlay-cleared' };
+  }
+  ctx.cameraTapPoint = target.center;
+  if (ctx.log) ctx.log(`备用入口：相机首击后页面未变化，补点相机一次 (${target.center.x},${target.center.y})`, 'info');
+  const rr = await adb.tap(serial, target.center.x, target.center.y);
+  if (!rr.ok) {
+    const error = new Error('相机首击未进入发布流程，补点相机的命令回执也未确认；本条按失败处理');
+    error.code = 'PUBLISH_ENTRY_UNCONFIRMED';
+    throw error;
+  }
+  return { status: 'retried' };
+}
+
+function isAccountEntryStep(step) {
+  return step.action === 'tapId' && /:(?:id)\/(?:tab_user|tvGoHomePage|rlPublish)$/.test(step.value || '')
+    || step.action === 'tapXY' && /^底部.*我/.test(step.name || '') && step.whenNotOn === 'com.shizhuang.duapp:id/rlPublish';
+}
+
+// 主入口和草稿箱出口同样必须等目标页，点击命令成功不等于转场完成。
+async function confirmAlbumEntry(serial, step, ctx) {
+  const allowDraft = step.value !== uimap.DEWU.draft.exitId;
+  const started = Date.now();
+  const waitMs = entryWaitMs();
+  let focus = '';
+  while (Date.now() - started < waitMs) {
+    if (ctx.cancelled && ctx.cancelled()) throw new Error('发布已取消');
+    focus = await adb.currentFocus(serial, { timeout: 3000 });
+    if (uimap.isPublishScreen(focus) || allowDraft && uimap.isDraftScreen(focus)) {
+      if (ctx.log) ctx.log(`${step.name || step.value}：已确认进入${uimap.isDraftScreen(focus) ? '草稿箱' : '发布流程'}`, 'info');
+      return;
+    }
+    await sleep(300, ctx.cancelled);
+  }
+  const error = new Error(`${step.name || step.value}：点击后等待 ${Number((waitMs / 1000).toFixed(1))} 秒仍未确认进入相册${allowDraft ? '或草稿箱' : ''}；当前页面${focus || '读不到'}。未选材、未填写、未提交，本条按失败处理。`);
+  error.code = 'PUBLISH_ENTRY_UNCONFIRMED';
+  throw error;
+}
+
+/**
+ * @param presetXml 可选：调用方**刚刚**读到的这一屏结构（中间没有任何动作）。用它当第 1 次
+ *   尝试的页面结构，省掉同一屏的第二次抓屏（实测一次 dump ~1-2s）。只为「读出这一屏之后
+ *   紧接着就要点它」的调用方准备（见 openPublishEntry 的备用入口那一段）。
+ */
+/**
+ * 这一屏的「长相」：每个有坐标的节点的 id / 文字 / 位置。
+ * 用在提交之后：点下去之后这一屏有没有**任何**变化 —— 变了就说明这一下被受理了
+ * （按钮变灰、出现「发布中/正在上传」、页面开始转场），这时绝不补点；
+ * 一点没变才说明这一下被吞了。多算几个字段只会更容易判「变了」，
+ * 而「变了」是安全方向（不补点）。
+ */
+function screenSig(nodes) {
+  return (nodes || []).filter(n => n && n.center)
+    .map(n => String(n.id || '') + '|' + String(n.text || '') + '|' + String(n.bounds || ''))
+    .sort().join('\n');
+}
+
+async function runStep(serial, step, data, ctx, presetXml) {
+  const checkCancelled = () => { if (ctx && ctx.cancelled && ctx.cancelled()) throw new Error('发布已取消'); };
+  checkCancelled();
+  // 这一步实际点中的坐标（提交发布没让页面跳开时要复点同一颗按钮）。
+  if (ctx) ctx.lastTapPoint = null;
+  if (ctx.publishEntryReady && isAccountEntryStep(step)) return { skipped: true, why: '已由备用入口进入发布流程' };
+  // 离开话题输入段前先结束最后一个话题，必须早于点击关联好物或提交发布。
+  if (!step.topicInput) await topicinput.finish(serial, ctx);
+  checkCancelled();
+  // ★ 屏幕守卫先判：不成立就**一个像素都不碰**，如实返回 skipped（交给调用方写日志）。
+  //   reusedXml = 守卫刚抓到的那份结构；同一步的点击可以在**第 1 次尝试**直接用它，
+  //   省掉第二次抓屏（实测一次 dump ~1-2s）。中间没有任何动作 ⇒ 结构一定新鲜。
+  // ★ 2026-10-03 提速：这一步这一屏会不会 idle —— 由批次里共享的缓存决定。
+  //   键用**步骤名**（定位表里写死的、不随数据变），所以同一条内容里的同一步、以及
+  //   后面每一条内容的同一步，都命中同一个键。缓存只在这一次发布里有效，不落盘。
+  const stepKey = (step && (step.name || (step.action + ':' + step.value))) || '';
+  const animOffSteps = (ctx && ctx.animOffSteps) || null;
+  const wantAnimOff = !!(animOffSteps && stepKey && animOffSteps[stepKey]);
+  // ★★ 「选图之后的转场」现在是**一等步骤**（action=transition，见 services/transition.js）。
+  //   这里仍然认一种**老表**的写法：`whenOn=edit_panel` 的守卫点击步（2026-10-16 之前发出去的
+  //   表就是那样写的）。把它**就地转成**转场语义 ⇒ 老用户不重新导入定位表也能拿到这个修复。
+  //   ★ 判据是「形状」，不是步骤名：名字是给用户看的，改名不该改变行为。
+  if (step.action === 'transition'
+    || (/^tap/.test(String(step.action || '')) && step.whenOn === 'com.shizhuang.duapp:id/edit_panel')) {
+    const spec = step.action === 'transition' ? step : {
+      name: '选图后的转场 · 等到标题填写页（旧表兼容）',
+      until: ['com.shizhuang.duapp:id/etTitle'],
+      from: ['com.shizhuang.duapp:id/flThumbSelect', 'com.shizhuang.duapp:id/edit_panel'],
+      maxClicks: 2,
+      timeout: 30000,
+    };
+    return require('./transition').run(serial, spec, ctx);
+  }
+  let reusedXml = (typeof presetXml === 'string' && presetXml) ? presetXml : null;
+  if (step && (step.whenOn || step.whenNotOn)) {
+    const g = await screenGuard(serial, step, ctx, wantAnimOff, reusedXml);
+    // 留给下一步：只有「这一步被跳过」时 runReal 才会把它交出去（见那边的 carryXml）。
+    if (ctx) ctx.lastGuardXml = g.xml || '';
+    if (!g.ok) return { skipped: true, why: g.why };
+    reusedXml = g.xml || null;
+    // ★★ 2026-10-04：守卫这一屏是关着动画抓到的 ⇒ 记下这个步骤名，本批后面同一步直接走关动画
+    //   （实测相册页那类屏，不关动画每轮白等 ~11s；关掉后 ~2s 就抓到）。
+    if (g.animOff && animOffSteps && stepKey && !animOffSteps[stepKey]) animOffSteps[stepKey] = true;
+  }
+  checkCancelled();
+  switch (step.action) {
+    case 'videoCover':
+      return require('./videocover').select(serial, ctx);
+    case 'tapText': case 'tapId': case 'tapDesc': case 'tapCardText': {
+      const cond = (step.action === 'tapText' || step.action === 'tapCardText') ? { text: step.value }
+        : step.action === 'tapId' ? { id: step.value } : { desc: step.value };
+      // ★★ 找不到节点**不立刻判失败**（2026-10-03 真机实测）：
+      //    关联好物搜索页「输完货号 → 结果图墙加载」那一两秒里，uiautomator 常常抓不到 idle ⇒
+      //    第一次 dump 要么退到没文字的备用通道、要么干脆空手；一次就判失败的表现是
+      //    「页面结构变了」这种假故障，而其实再等半秒就好。重试 3 次再报，并把每次重试写进日志。
+      let node = null, nodes = [], lastWhy = '', lastNoText = false;
+      // ★ 「点前 N 个匹配」用的：want = 要一次点几个，hit = 这一屏实际找到几个
+      let want = 1, hit = [], lastFound = -1;
+      // 分段编辑屏（「1 / 5」+「下一步」）每推进一段都要多观察一轮 ⇒ 轮数跟着放宽（最多 12）。
+      let maxAttempts = 3;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        checkCancelled();
+        // ★ 必须带包名：发布页是**动画页**，uiautomator 抓不到时只有带上包名才会退到 dumpsys。
+        //   （以前这里不传 pkg ⇒ 备用通道永远走不到 ⇒ 真机上按 id 点「关联好物」直接失败；
+        //    而「抓取页面结构」那条路一直带着包名，所以这个洞一直没被暴露。）
+        //   代价如实说：备用通道**没有文字** ⇒ 那一屏上按文字找的步骤仍然找不到（但按 id 的能过）。
+        let d;
+        if (attempt === 0 && reusedXml) {
+          // ★ 2026-10-03 提速：守卫刚抓过、并且确认过就是这一屏 ⇒ 不再抓第二次。
+          d = { ok: true, xml: reusedXml, why: '', via: 'screenGuard' };
+          reusedXml = null;   // 只复用一次
+        } else {
+          // ★ 2026-10-03 提速：这里**不要** dumpEx 内部的「重试 1 次 / 隔 1200ms」——
+          //   外层这个 for(attempt<3) 本来就会重试（每次先抓屏再找，间隔 450ms），
+          //   两层叠加只会让「页面还没就绪」时白等一轮又一轮。
+          // ★ 2026-10-03 提速：这里**不要** dumpEx 内部的「重试 1 次 / 隔 1200ms」——
+          //   外层这个 for(attempt<3) 本来就会重试（每次先抓屏再找，间隔 450ms），
+          //   两层叠加只会让「页面还没就绪」时白等一轮又一轮。
+          //   preferAnimOff：这一屏已知不会 idle ⇒ 直接关动画抓，不再白等那 ~11 秒。
+          d = await mediapermission.dump(serial, { pkg: uimap.DEWU.pkg, retries: 0, preferAnimOff: wantAnimOff }, ctx);
+        }
+        if (!d.ok) {
+          lastWhy = `拿不到界面结构：${d.why}${d.idle ? '（这个页面一直不 idle）' : ''}`;
+          if (attempt < 2) { await sleep(450); continue; }
+          // ★★ 2026-10-04：要抛错了，这时才附带一句「设备在不在线」（见 adb.offlineHint）。
+          throw new Error(lastWhy + (await adb.offlineHint(serial)));
+        }
+        if (d.animOff) {
+          // ★ 把「这一步这一屏不会 idle」记下来（键 = 步骤名）。本批后面再遇到同一步就直接
+          //   走关动画，不再先白等一次 idle 超时（真机实测相册页那一下 11.1s，关动画后 2s）。
+          //   必须**说出来**（只第一次说）：静默换通道会让人以为「这次怎么变快了」无从解释。
+          const learned = !!(animOffSteps && stepKey && !animOffSteps[stepKey]);
+          if (learned) animOffSteps[stepKey] = true;
+          if (ctx && ctx.log) {
+            ctx.log('页面一直不 idle，已临时关掉系统动画抓到结构（抓完已还原）'
+              + (learned ? '；本批后面再遇到这一步就直接走关动画，不再白等那 ~11 秒' : ''), 'warn');
+          }
+        }
+        lastNoText = !!d.noText;
+        if (d.noText && ctx && ctx.log) {
+          ctx.log('这一屏是动画页，已走 dumpsys 备用通道（只有 id / 坐标，没有文字）', 'warn');
+        }
+        nodes = uimap.parseNodes(d.xml);
+        // 相机和发布提交是先点后判；其他入口保持“先判定再点”，
+        // 这样普通页面上的明确弹窗在点击前就会清理，不会把点击落到遮罩上。
+        const isSubmit = /^提交发布/.test(step.name || '') || step.submit === true
+          || (step.action === 'tapText' && step.value === '发布');
+        if (!isSubmit && await clearBlockingModal(serial, nodes, ctx, step)) continue;
+        // ★★ 「点前 N 个匹配」：N 来自这一步的 count（缺省 1 = 老行为，只点第一个）。
+        //    为什么要有 N：得物相册的缩略图没有文字/描述，只能按 resource-id 点，
+        //    而「取第一个匹配」⇒ 一条内容多张图时只选上第 1 张（其余图白推了）。
+        //    张数写 ${imageCount}（这个叶子真实的图片数，见下面的 data）。
+        want = uimap.countOf(step.count);
+        // count 写了但解析不出 ≥1 的数（数据里没有图片清单）⇒ **不许默默按 1 张发**：
+        // 发出去才发现少图是最难查的那种错（对不上发布单、也没有任何报错）。当场说清楚。
+        if (step.count != null && step.count !== '' && !(Number(step.count) >= 1)) {
+          throw new Error(`这一步的「count」解析成了「${step.count}」——它要是 ≥1 的整数。`
+            + `写 ${'${imageCount}'} 时，这个值来自「这条素材里有几张图」；这条记录里读不到图片清单`
+            + `（报告导入的老行可能没有）⇒ 改成固定数字，或先把素材重新扫一遍。`);
+        }
+        const exact = uimap.findNodes(nodes, cond).filter(x => x && x.center);
+        // ★★ 2026-10-16：`ctx.forceAlternateEntry`（只由「备用入口试发」模块传入）在这里
+        //   **假装账号没有「主页」按钮** —— 哪怕它真的在屏幕上，也当成没找到。
+        //   为什么是"假装找不到"而不是"另走一条路"：后面那段回退代码就是**线上无主页账号
+        //   真正走的那条路**（回首页 → 点动态 → 等提示结束 → 点相机）。让试发从同一个入口
+        //   进去，才谈得上"测的就是线上那条路"；自己另写一条，两条迟早各走各的。
+        if ((!exact.length || ctx.forceAlternateEntry) && step.action === 'tapId' && step.value === 'com.shizhuang.duapp:id/tvGoHomePage') {
+          // 浏览导航可能与素材推送重叠；备用入口必须留到相册就绪之后。
+          if (ctx.deferPublishEntry) return { deferred: true };
+          if (ctx.log) ctx.log('当前账号页面没有「主页」按钮，切换动态流相机入口', 'info');
+          await openPublishEntry(serial, ctx);
+          return { alternateEntry: true };
+        }
+        let rawHit = exact.length ? exact : uimap.findNodes(nodes, { contains: step.value }).filter(x => x && x.center);
+        if (rawHit.length && await clearStepOverlay(serial, nodes, ctx, rawHit[0], step)) continue;
+        // ★★ tapCardText：颜色文字**不是**选中卡片的开关
+        //   （真机实测：点它弹「选择商品规格」）。这里把「颜色文字」
+        //   换算成「包住它的那张商品图」，点图心才等于选中整张卡。
+        hit = step.action === 'tapCardText'
+          ? rawHit.map(h => uimap.cardOf(nodes, h, step.card)).filter(x => x && x.center)
+          : rawHit;
+        // 找到了文字却没有卡包住它 ⇒ 版式变了 / card 写错了。
+        // 不能软退成「点第一张就算了」——点错卡是静默挂错商品，最难查。
+        if (step.action === 'tapCardText' && rawHit.length && !hit.length) {
+          throw new Error(`找到了「${step.value}」，但没有任何一张「${step.card}」把它包住 —— `
+            + `结果页的版式变了，或者 card 写错了。不瞎点（点错卡＝挂错商品）。`);
+        }
+        // ★★★ 2026-10-04 真机实测（用户指出）：得物贴完文案后会**自动识别视频中的好物**，
+        //   识别期间「关联好物」那一行是 `clickable=true` 但 **`enabled=false`** ——
+        //   系统不响应任何点击（点左侧文字区、点右侧箭头都一样），
+        //   而表现是「点了没反应 → 400ms 后抓屏还是这一屏 → 后面那步报找不到搜索框」，
+        //   报错指向的位置离真因很远。
+        //   ⇒ 这一步若写了 `waitEnabled:true`：
+        //     **有节点但不可用 = 还没到能点的时候**，继续等（不点、不报错）；
+        //     等到可用再点。等不到仍如实报「一直处于禁用状态」——不硬点。
+        //   ★ 等待次数可配（`waitEnabledTries`，缺省 3）：得物自动识别视频好物实测要十几秒，
+        //     默认那 3 次（≈8s）根本不够 ⇒ 好物这一步会「等不到」而失败。
+        //   ★★ 这一分支**不能用外层 for 的 attempt<3 限制** —— 那 3 次是给「节点还没渲染出来」用的，
+        //     和「节点在、但禁用中」是两件事。这里自己数次数、自己等。
+        if (step.waitEnabled) {
+          const tries = Number(step.waitEnabledTries) > 0 ? Number(step.waitEnabledTries) : 3;
+          let waitedForEnable = 0;
+          for (;;) {
+            hit = (step.action === 'tapCardText'
+              ? rawHit.map(h => uimap.cardOf(nodes, h, step.card)).filter(x => x && x.center)
+              : rawHit);
+            const usableNow = hit.filter(n => n.enabled !== false);
+            if (usableNow.length >= want) { hit = usableNow; break; }   // 可用且够数 ⇒ 出去点
+            if (!hit.length && attempt < 2) break;                       // 节点都没出现 ⇒ 交给外层重试
+            if (waitedForEnable >= tries) {
+              throw new Error(`「${step.value}」等 ${(waitedForEnable * 0.7).toFixed(1)}s 仍是禁用状态`
+                + `（enabled=false，得物正在自动识别视频中的好物，识别期间这一行不可点）。`
+                + `不硬点。要么识别卡住了，要么得物改版了。`);
+            }
+            waitedForEnable++;
+            if (ctx && ctx.log && (waitedForEnable === 1 || waitedForEnable % 3 === 0)) {
+              ctx.log(`「${step.value}」还不可点（得物正在自动识别视频好物）——已等 `
+                + `${(waitedForEnable * 0.7).toFixed(1)}s，继续等`, 'info');
+            }
+            await sleep(700);
+            const d2 = await mediapermission.dump(serial, { pkg: uimap.DEWU.pkg, retries: 0, preferAnimOff: wantAnimOff }, ctx);
+            if (d2.ok) { nodes = uimap.parseNodes(d2.xml); rawHit = uimap.findNodes(nodes, cond).filter(x => x && x.center); }
+          }
+        }
+        hit = (step.action === 'tapCardText'
+          ? rawHit.map(h => uimap.cardOf(nodes, h, step.card)).filter(x => x && x.center)
+          : rawHit);
+        // 正常加载是唯一仍然先等的情况：它不是可关闭弹窗，加载期间点目标也不会生效。
+        // 普通弹窗不在点击前预判；先发一次真实目标点击，再由调用方核对页面是否变化。
+        // 只等“真的盖在当前目标上”的加载态。页面上别处残留一行同类文字，
+        // 不能把整条内容一直卡在等待里。
+        const busyTarget = hit[0] || uimap.findNodes(nodes, cond).find(x => x && x.center);
+        if (transitionSvc.isBusy(nodes, busyTarget)) {
+          if (maxAttempts < 12) maxAttempts++;
+          if (ctx && ctx.log) ctx.log('页面正在导出/处理图片，等遮罩消失后再继续（不点击）', 'info');
+          await sleep(600, ctx && ctx.cancelled);
+          continue;
+        }
+        if (hit.length >= want) {
+          node = hit[0];
+          break;
+        }
+        // ★★ 2026-10-17 转场自愈（另一台设备的真实卡点）：选完图会先落在**图片编辑页**，
+        //   屏上是「1 / 5」+「下一步」；老定位表/导入表那一步只写了「等 etTitle」，
+        //   于是停在编辑页，报「找不到 etTitle；当前可见文本：1 / 5 / 下一步」。
+        //   判据极窄（有 `i / N` 计数 + 恰好一颗「下一步」）才点，同一屏最多 3 次、间隔 ≥2.4s；
+        //   其余屏一个像素都不碰。
+        if (await transitionSvc.advanceStage(serial, nodes, ctx)) {
+          if (maxAttempts < 12) maxAttempts++;
+          await sleep(300);
+          continue;
+        }
+        lastFound = hit.length;
+        if (attempt < 2) {
+          if (ctx && ctx.log) ctx.log(`还没看到「${step.value}」，等半秒再抓一次（第 ${attempt + 2} 次）`, 'info');
+          await sleep(450);
+        }
+      }
+      if (!node || !node.center) {
+        // ★ 走到 dumpsys 备用通道就**拿不到文字**：这时候说「找不到文字」等于没说，
+        //   必须点明是通道的问题、并给出唯一可行的改法（改成 tapId 用 resource-id）。
+        //   不加这一段的话，报错会退化成「找不到「发布」；当前可见文本：（空）」—— 比原来那句
+        //   「拿不到界面结构：…这个页面一直不 idle」还难查。
+        if (lastNoText && step.action !== 'tapId') {
+          throw new Error(`找不到「${step.value}」：这一屏是动画页，已走 dumpsys 备用通道，`
+            + `而那条通道**拿不到文字** —— 按${step.action === 'tapDesc' ? '描述' : '文字'}找的步骤在这屏上用不了。`
+            + `把这一步的 action 改成 tapId（value 填 resource-id）就能过。`);
+        }
+        if (want > 1) {
+          throw new Error(`这一步要一次点 ${want} 个「${step.value}」，但这一屏上只找到 `
+            + `${Math.max(0, hit.length)} 个（前几次更少：${lastFound}）—— 不静默少点（少发一张图，`
+            + `发出去才发现，最难查）。要么把 count 改小，要么确认素材真的都推进相册了。`);
+        }
+        const blocked = blockedTargetError(nodes, step);
+        if (blocked) throw blocked;
+        const visible = visibleTextOf(nodes);
+        throw new Error(`找不到「${step.value}」；当前可见文本：${visible || '（空）'}`);
+      }
+      // ★ 要几个就点几个（顺序 = dump 顺序 = 界面上从前往后）。
+      //   中间留 250ms：相册点中一格会出现选中角标、右下角按钮文字会变成「下一步 (2)」，
+      //   连着点太快有被系统当成同一次手势的风险。
+      let pickList = hit.slice(0, want);
+      // ★ 2026-10-03 加速：多点一次 shell 发完（设备端 sleep 250ms 间隔），
+      //   比「一条一条发 + JS 侧 sleep」少 N-1 次往返（实测 3 击 380ms → 127ms）。
+      //   250ms 间隔的原因没变：相册点中一格会出现选中角标、右下角按钮会变成「下一步 (2)」，
+      //   连着点太快有被系统当成同一次手势的风险。间隔值可调（见定位表 count 那段注释）。
+      checkCancelled();
+      if (ctx) ctx.lastTapPoint = pickList[0] && pickList[0].center
+        ? { x: pickList[0].center.x, y: pickList[0].center.y } : null;
+      // 提交后判断「这一下有没有被受理」的基线：点之前这一屏长什么样。
+      if (ctx) ctx.lastTapSig = screenSig(nodes);
+      const r = await adb.tapSeq(serial,
+        pickList.map(n0 => ({ x: n0.center.x, y: n0.center.y })),
+        pickList.length > 1 ? 250 : 0);
+      if (!r.ok) throw new Error('点击失败：' + (r.stderr || '').trim());
+      if (step.action === 'tapId' && ['com.shizhuang.duapp:id/rlPublish', uimap.DEWU.draft.exitId].includes(step.value)) {
+        await confirmAlbumEntry(serial, step, ctx);
+      }
+      // 把选材检查交给下一次转场观测，正常路径不额外抓屏。
+      if (step.action === 'tapId' && step.value === 'com.shizhuang.duapp:id/flThumbSelect') {
+        const nextWasEnabled = nodes.some(n => /:id\/(?:tvNextStep|flNextStep)$/.test(n.id) && n.enabled);
+        let repairs = 0, unknownObservations = 0, checksAgreeStreak = 0;
+        ctx.confirmSelection = async d => {
+          const nodes = uimap.parseNodes(d.xml || '');
+          if (!nodes.some(n => n.id === step.value)) return true;
+          const counts = nodes.filter(n => /:id\/(?:tvNextStep|flNextStep)$/.test(n.id))
+            .map(n => (n.text + ' ' + n.desc).match(/下一步\s*[（(]\s*(\d+)\s*[）)]/)).filter(Boolean).map(m => Number(m[1]));
+          if (ctx.log) ctx.log('选材观测：预期 '+want+'；数量标记 '+(counts.length?counts.join('/'):'无')+'；图片格 '+nodes.filter(n=>n.id===step.value).length+'；可勾选 '+nodes.filter(n=>n.id===step.value&&n.checkable).length, 'info');
+          const actual = counts.length && counts.every(n => n === counts[0]) ? counts[0] : null;
+          if (actual === want) { ctx.confirmSelection = null; return true; }
+          const cells = nodes.filter(n => n.id === step.value);
+          // 相册只有一份素材时，从不可用变为可用的下一步可证明已选一份；无需依赖数字文案。
+          if (want === 1 && cells.length === 1 && !nextWasEnabled
+            && nodes.some(n => /:id\/(?:tvNextStep|flNextStep)$/.test(n.id) && n.enabled)) {
+            ctx.confirmSelection = null; return true;
+          }
+          const checkable = cells.filter(n => n.checkable && typeof n.checked === 'boolean');
+          // 只接受明确的可勾选状态；普通节点默认 checked=false 不能证明漏选。
+          if (checkable.length) {
+            const targets = pickList.map(old => cells.find(n => n.bounds === old.bounds)).filter(Boolean);
+            const checkedAll = checkable.filter(n => n.checked);
+            const missingPicked = targets.filter(n => n.checkable && !n.checked);
+            const extraChecked = checkedAll.filter(n => !targets.includes(n));
+            let toggle = [];
+            if (checkedAll.length > want) {
+              // 多选了：先取消「不是这次点的那几格」；还不够再取消这次点的（按倒序，尽量保留前几张）。
+              toggle = extraChecked.slice(0, checkedAll.length - want);
+              const still = checkedAll.length - want - toggle.length;
+              if (still > 0) toggle = toggle.concat(targets.filter(n => n.checked && !toggle.includes(n)).slice(-still));
+            } else if (checkedAll.length < want) {
+              toggle = missingPicked.slice(0, want - checkedAll.length);
+            }
+            if (toggle.length) {
+              if (repairs >= 3) {
+                const error = new Error(`选材自动恢复未完成：预期 ${want} 张，实际 ${actual === null ? '读不到' : actual}；`
+                  + `连续 ${repairs} 次自动调整后勾选仍对不上（当前勾选 ${checkedAll.length}），保留现场`);
+                error.code = 'PUBLISH_CONTENT_UNCONFIRMED'; throw error;
+              }
+              checkCancelled(); repairs++;
+              const r = await adb.tapSeq(serial, toggle.map(n => n.center), toggle.length > 1 ? 250 : 0);
+              if (!r.ok && ctx.log) ctx.log('选材自动恢复的点击回执未确认，将按下一次页面观测核实', 'warn');
+              if (ctx.log) {
+                ctx.log(`选材自动恢复：${checkedAll.length > want ? '取消多选' : '补选'} ${toggle.length} 张`
+                  + `（第 ${repairs}/3 次；当前勾选 ${checkedAll.length}，目标 ${want}）`, 'info');
+              }
+              await sleep(400, ctx && ctx.cancelled);
+              return false;
+            }
+            if (checkedAll.length === want) {
+              // 勾选状态已经等于目标，但「下一步 (n)」的数字还没刷新 —— 再给一次观测；
+              // 连续两次都是这样，就按勾选状态确认（按钮文案滞后不影响实际选中的图片数）。
+              if (++checksAgreeStreak >= 2 || actual === null) {
+                if (ctx.log) ctx.log(`选材已按勾选状态确认：${checkedAll.length}/${want} 张（数量文案 ${actual === null ? '读不到' : actual}，判定为刷新滞后）`, 'info');
+                ctx.confirmSelection = null; return true;
+              }
+              await sleep(350, ctx && ctx.cancelled);
+              return false;
+            }
+            checksAgreeStreak = 0;
+          }
+          // 结构尚未就绪时先让转场循环继续观测，不能首次读不到就终止。
+          if (!checkable.length && unknownObservations++ < 2) return false;
+          const error = new Error(`选材自动恢复未完成：预期 ${want} 张，实际 ${actual === null ? '读不到' : actual}；`
+            + `${checkable.length ? '自动补选/取消后仍未确认' : '缺少可定位的勾选状态'}，保留现场`);
+          error.code = 'PUBLISH_CONTENT_UNCONFIRMED'; throw error;
+        };
+      }
+      if (want > 1 && ctx && ctx.log) {
+        const pts = pickList.map(n0 => n0.center.x + ',' + n0.center.y).join(' / ');
+        ctx.log(`${step.name || step.value}：一次点了 ${want} 个（相册按时间倒序，点的是最前面 ${want} 格；坐标 ${pts}）`, 'info');
+      }
+      return;
+    }
+    case 'tapXY': {
+      // ★ 按**固定坐标**点，不抓屏（2026-10-03 加速）。
+      //   坐标从定位表 value 解析（"x,y"，多个点用 ; 分隔）。
+      //   解析不出坐标 → 当场报错，**绝不**默默点 (0,0)（那会点到屏幕左上角，等于乱点）。
+      //   为什么快：这台模拟器 `uiautomator dump` 单次 ~1.5s，而 `input tap` 只要 ~0.13s；
+      //   版式固定的按钮（底部我 / 主页 / 下一步 / 标题框 / 提交发布…）每次点前抓一次屏，
+      //   一条内容就白花十几秒。
+      //   ★ 代价：没有「找不到就不点」的保护。定位表里只该给**版式固定、且下一步能立刻
+      //     发现异常**的格子用它；要保险就配 whenOn 屏幕守卫。
+      const pts = uimap.parsePoints(step.value);
+      if (!pts.length) {
+        throw new Error(`这一步（tapXY）的坐标解析不出来：「${step.value}」—— `
+          + `要写成 "540,1871" 这种 x,y 形式（多个点用分号隔开）。`);
+      }
+      // 提交是唯一“先点后判”的固定坐标动作；其他 tapXY 仍先清明确弹层。
+      // 这个判断必须在本分支内定义，不能引用 tapId/tapText 分支里的局部变量。
+      const isSubmit = /^提交发布/.test(step.name || '') || step.submit === true;
+      // 普通固定坐标点击若带屏幕守卫，复用守卫刚给的新鲜结构判断遮挡；
+      // 没有守卫时仍保持原来的零 dump 快路径。提交仍严格“先点后判”。
+      // 这样既覆盖下一步/底部入口的遮罩，也不给每条固定坐标点击平白增加 1–2 秒。
+      if (pts.length && !isSubmit && reusedXml) {
+        // 固定坐标也需要在真正点击前完成“加载只等待、明确弹窗先关闭”的判断。
+        // 正常导出遮罩可能持续数秒；这里等到它消失后重新取结构再点，不能只抓一次。
+        const waitStarted = Date.now();
+        const waitLimit = Math.max(15000, Number(step.timeout) || 0);
+        for (;;) {
+          checkCancelled();
+          const page = { ok: true, xml: reusedXml };
+          reusedXml = null;
+          const nodes = page.ok ? uimap.parseNodes(page.xml) : [];
+          const target = nodes.find(n => n.center && Math.abs(n.center.x - pts[0].x) <= 8
+            && Math.abs(n.center.y - pts[0].y) <= 8)
+            || { center: pts[0], box: { x1: pts[0].x, y1: pts[0].y, x2: pts[0].x, y2: pts[0].y } };
+          if (page.ok && transitionSvc.isBusy(nodes, target)) {
+            if (ctx && ctx.log) ctx.log('页面正在正常加载，等遮罩消失后再执行固定坐标点击（不点击）', 'info');
+            if (Date.now() - waitStarted >= waitLimit) {
+              throw new Error(`等待正常加载遮罩消失超过 ${(waitLimit / 1000).toFixed(1)}s，仍未执行固定坐标点击`);
+            }
+            await sleep(400, ctx && ctx.cancelled);
+            continue;
+          }
+          // 其他普通入口仍是“先判定再点”；只有相机和发布提交按用户口径
+          // 改成先点后判。正常加载在上面单独等待，不把普通容器当弹窗预判。
+          if (await clearStepOverlay(serial, nodes, ctx, target, step)) {
+            const fresh = await mediapermission.dump(serial, {
+              pkg: uimap.DEWU.pkg, retries: 0, preferAnimOff: wantAnimOff
+            }, ctx);
+            if (fresh.ok) reusedXml = fresh.xml;
+            continue;
+          }
+          break;
+        }
+      }
+      // ★★★ 2026-10-04 新增：**越界即拦**（坐标空间守卫的最后一道）。
+      //   为什么必须在真正发 tap 之前拦：`input tap` 对越界坐标**不报错** ——
+      //   实测在 1920x1080 的屏上 `input tap 945 1869` 返回 rc=0、一个字都不说、什么都没点到。
+      //   所以「写死的坐标落到了屏幕外」在真机上表现为**每一步都安静地点偏**，日志一条错都没有。
+      //   尺寸从 `adb.uiSize()` 取（= `dumpsys window displays` 的 `cur=`，那才是 tap 用的坐标系；
+      //   不能拿 `wm size`：它报的是自然方向尺寸，横屏时会给出相反的宽高）。
+      //   读不到尺寸时停止，避免在旋转或断连时继续点击；每个固定坐标步骤重新读取。
+      ctx.uiSize = await stableCoordinates(serial, ctx.uiMapScreen, ctx);
+      const badPts = uimap.outOfScreenTapPoints([step], ctx.uiSize);
+      if (badPts.length) {
+        const sz = ctx.uiSize;
+        const error = new Error(`这一步（${step.name || 'tapXY'}）写死的坐标落在屏幕之外：`
+          + badPts.map(p => `${p.x},${p.y}`).join(' / ')
+          + `；当前坐标系是 ${sz.w}x${sz.h}（${sz.landscape ? '横屏' : '竖屏'}）。`
+          + `input tap 对越界坐标**不报错**（实测 rc=0、什么都没点到）⇒ 不拦就是全程静默点偏。`
+          + `多半是抓定位表时的分辨率/方向和现在不一样：把模拟器调回去，或停到得物发布页`
+          + `重新「抓取页面结构」→ 导入。`);
+        error.code = 'UI_COORDINATES';
+        throw error;
+      }
+      checkCancelled();
+      const r = await adb.tapSeq(serial, pts, pts.length > 1 ? 250 : 0);
+      if (!r.ok) throw new Error('点击失败：' + (r.stderr || '').trim());
+      if (pts.length > 1 && ctx && ctx.log) {
+        ctx.log(`${step.name || 'tapXY'}：一次点了 ${pts.length} 个坐标（${pts.map(p => p.x + ',' + p.y).join(' / ')}）`, 'info');
+      }
+      return;
+    }
+    case 'input': {
+      if (step.topicInput) {
+        await topicinput.write(serial, step.value, ctx);
+        return;
+      }
+      // ★ 输入通道（中文必须走 ADBKeyboard 广播）由 adb.inputText 自己按**设备真实输入法状态**
+      //   判定 —— 以前这里传的是配置项 `publish.adbKeyboard`，而那个键全仓没有任何地方会写它
+      //   （界面没有开关、默认配置里也没有）⇒ 恒为假 ⇒ 中文永远走 `input text`（实测打不进中文、
+      //   却返回成功）⇒ 帖子会发出去但标题正文是空的，日志还写「发布成功」。
+      const r = await adb.inputText(serial, step.value);
+      if (!r.ok) throw new Error('输入失败：' + (r.stderr || '').trim());
+      // ★★★ 2026-10-04 新增：**回读**输入框，确认这串字真的进去了。
+      //   为什么非有不可：广播通道**永远返回成功**，而「没进去」与「进去了」在截图/日志上完全一样
+      //   （框空着的时候 text 就是占位符「添加标题」）。今晚真机实测有两种静默失败都栽在这上面，
+      //   而且都会被记成「发布成功」：
+      //     · 空格被改写成**字面 `%s`** 打进标题（已修，见 adb.inputText）；
+      //     · 输入法不是 ADBKeyboard 时中文**整串丢失**，广播照样返回成功。
+      //   校验对象 = **紧邻的上一步 tapId 点的那个框**（由 runReal 传进来；只认紧邻 ⇒ 话题步不会误报）。
+      //   判据：完全一致，或以「期望串的前 12 个字符」开头（得物可能对标题做截断/规整）。
+      //   读不到结构时有限重读；仍未知就停止批次，不让未知内容继续提交。
+      const checkId = String((ctx && ctx.inputCheckId) || '');
+      if (checkId) {
+        const want = String(step.value == null ? '' : step.value);
+        // 比对前**先把空白全部去掉**：正文是多行的（`\n`），而 dump 把换行渲染成什么形态
+        // 不可控（`&#10;` / 真换行 / 空格）⇒ 拿原文比会**假报不一致**。
+        // 这一步要抓的是「整串丢了 / 被改写成 %s / 串进了上一次的残留」这类**内容级**损坏。
+        const norm = (x) => String(x == null ? '' : x).replace(/\s+/g, '');
+        const wn = norm(want);
+        const head = wn.slice(0, Math.min(12, wn.length));
+        const sameText = (text) => {
+          const gn = norm(text);
+          if (gn === wn) return true;
+          // 只接受「得物把内容截短」：框里的字必须是期望串的**前缀**。
+          // 反方向（框里比期望多出内容）＝串字/残留，必须重输，绝不能放过。
+          // 截短也得「像被页面截掉」：至少落进 12 个字（整串不足 12 时要求全中），
+          // 否则「只进去几个字」会被当成得物截断放过 —— 那正是发错内容的入口。
+          return gn.length >= Math.min(12, wn.length) && wn.startsWith(gn);
+        };
+        let got = null, same = false, lastText = '', fixes = 0;
+        // ★★ 2026-10-17（用户口径：回读不一致要自动解决，不许把这一条判死）：
+        //   不一致的根因有两类 —— ①框里本来就有残留，这次输入是**追加**（串字）；
+        //   ②输入法/通道把空格、emoji 或整串吞了。两类都可以用同一个动作修：
+        //   重新定位 → 清空当前框（ADB_CLEAR_TEXT）→ 重输 → 再回读。
+        //   最多自动恢复 2 次；仍不一致才如实失败（不按「大概填上了」继续提交）。
+        for (let round = 0; round <= 2 && !same; round++) {
+          for (let read = 0; read < 3; read++) {
+            checkCancelled();
+            got = await adb.readTextOf(serial, checkId, { pkg: uimap.DEWU.pkg });
+            if (got.ok) break;
+            if (read < 2) await sleep(300, ctx && ctx.cancelled);
+          }
+          if (!got.ok) {
+            const error = new Error(`「${step.name || '输入'}」有限重读后仍无法确认内容（${got.why}），本条按失败处理并保留现场`);
+            error.code = 'PUBLISH_CONTENT_UNCONFIRMED'; throw error;
+          }
+          lastText = String(got.text || '');
+          same = sameText(lastText);
+          if (same) {
+            if (fixes && ctx && ctx.log) ctx.log(`「${step.name || '输入'}」清空重输后已回读一致（${lastText.length} 字）`, 'ok');
+            else if (ctx && ctx.log) ctx.log(`「${step.name || '输入'}」已回读确认填进去了（${lastText.length} 字）`, 'info');
+            break;
+          }
+          if (round >= 2) break;
+          fixes++;
+          if (ctx && ctx.log) {
+            ctx.log(`「${step.name || '输入'}」回读不一致（框里 ${JSON.stringify(lastText.slice(0, 24))}），`
+              + `自动清空重输（第 ${fixes}/2 次）`, 'warn');
+          }
+          await runStep(serial, { action: 'tapId', value: checkId, name: '输入自动恢复定位' }, {}, ctx);
+          const clr = await adb.clearText(serial);
+          if (!clr.ok && ctx && ctx.log) ctx.log(`清空输入框回执未确认（${clr.how}：${clr.stderr || '无输出'}），继续重输并按回读判定`, 'warn');
+          const retry = await adb.inputText(serial, want);
+          if (!retry.ok && ctx && ctx.log) ctx.log('补输回执未确认，继续按实际内容核验', 'warn');
+          await sleep(250, ctx && ctx.cancelled);
+        }
+        if (!same) {
+          throw new Error(`输入回读不一致：「${step.name || checkId}」期望的是 `
+            + `${JSON.stringify(want.slice(0, 24))}…（共 ${want.length} 字），`
+            + `而框里实际是 ${JSON.stringify(lastText.slice(0, 40))}`
+            + ' —— 已自动清空重输 2 次仍不一致（常见原因：空格/emoji 被通道改写、或当前输入法不是 ADBKeyboard）。'
+            + ' 不许按「大概填上了」继续往下点，否则会发出一条标题/正文不对的帖子。');
+        }
+      }
+      return;
+    }
+    case 'wait':
+      await sleep(Math.max(0, Number(step.value) || 1000), ctx && ctx.cancelled);
+      checkCancelled();
+      return;
+    case 'waitId': {
+      // ★★ 2026-10-03 真机实测加：等到**某一块出现**再往下走（两屏之间的转场）。
+      //   图文干跑实测卡死点：得物「相册 → 图片编辑页」是异步转场，紧接着点「下一步」会白点，
+      //   而报错会指向**后面**找 etTitle 那一步（离真正原因很远，最难查的那类）。
+      //   这里等不到就硬失败并点名等的是什么 —— 绝不硬点（硬点只会点到别的屏上）。
+      const wantId = String(step.value || '').trim();
+      if (!wantId) throw new Error('这一步（waitId）没写要等的 resource-id');
+      const tmo = Math.max(1000, Number(step.timeout) || 10000);
+      let t0 = Date.now();
+      let busyWait = 0;
+      for (;;) {
+        checkCancelled();
+        const d = await mediapermission.dump(serial, { pkg: uimap.DEWU.pkg, retries: 0, preferAnimOff: wantAnimOff }, ctx);
+        const seen = d.ok ? uimap.parseNodes(d.xml) : [];
+        if (seen.some(n => String(n.id) === wantId)) return;
+        // 导出遮罩期间不点、也不按普通超时算（最多额外等 60s，遮罩还在就如实失败）。
+        // 等目标 id 时还没有目标坐标；只接受真正的全屏加载层或 Dialog/Popup 内的加载，
+        // 不把页面别处残留的「正在处理图片」当成整页遮罩。
+        if (d.ok && transitionSvc.isBusy(seen,
+          seen.find(n => String(n.id) === wantId) || null) && busyWait < 120) {
+          busyWait++;
+          if (ctx && ctx.log && busyWait === 1) ctx.log('等着「' + wantId + '」时页面正在导出/处理图片，等它结束（不点击）', 'info');
+          await sleep(500, ctx && ctx.cancelled);
+          continue;
+        }
+        // ★★ 2026-10-17 转场自愈：图片编辑页（「1 / 5」+「下一步」）不在老表的来源屏里，
+        //   只写「等 etTitle」就会永远等不到（另一台设备的真实现场）。
+        //   同一屏点了没反应会隔 2.4s 重试（最多 3 次）；推进后重新计时，陌生屏仍然不点。
+        if (await transitionSvc.advanceStage(serial, seen, ctx)) {
+          t0 = Date.now();
+          await sleep(300, ctx && ctx.cancelled);
+          continue;
+        }
+        const waited = Date.now() - t0;
+        if (waited >= tmo) {
+        const visible = d.ok
+          ? uimap.parseNodes(d.xml).filter(n => n.text).slice(0, 10).map(n => n.text).join(' / ')
+          : '';
+          throw new Error(`等了 ${(waited / 1000).toFixed(1)}s 也没等到「${wantId}」出现`
+            + (d.ok ? '' : `（连界面结构都抓不到：${d.why}）`)
+          + (visible ? `；当前可见文本：${visible || '（空）'}` : '')
+            + ' —— 编辑页那颗「下一步」已按上限重试仍未生效，或得物改版了。不盲点陌生屏。');
+        }
+        if (ctx && ctx.log) ctx.log(`等「${wantId}」出现…（已等 ${Math.round(waited / 1000)}s）`, 'info');
+        await sleep(400, ctx && ctx.cancelled);
+      }
+    }
+    case 'back':
+      await adb.keyevent(serial, 4);
+      return;
+    case 'screenshot':
+      await saveShot(serial, step.value || 'shot', ctx);
+      return;
+    default:
+      throw new Error('未知步骤类型：' + step.action);
+  }
+}
+
+/**
+ * 抓界面结构（给「抓取页面结构」按钮用）—— 比 adb.dumpEx 多一层「你现在停在哪一屏」。
+ *
+ * 为什么必须先看这一屏：dump 抓的**就是当前这一屏**。抓错页面的代价是**一份错坐标的表**，
+ * 而错坐标不会当场报错 —— 它会一路点到「发布成功」（本项目已经吃过这个亏，见 HANDOFF ⑪）。
+ * 已知的两个坑（真机实测）：① 得物首页自己的 tab 栏里也有一个「视频」（`tvTabTile`），
+ * 抓成首页就被它污染；② 发布页首屏是「选素材」，抓它才配得出 `ivCamera → 选图 → 下一步 …` 这一串。
+ *
+ * 分三档处理（不是一刀切拦住）：
+ *   · 读不到 focus（命令失败/正则没匹配）→ **照常抓**：这是"检查没做成"，不是"抓错页面"；
+ *   · 读到了但**不是得物** → **拦下来**并给出「怎么进发布页」（那时抓出来的是桌面，表毫无意义）；
+ *   · 是得物但**不是发布页** → 照常抓 + 明确告警（「填标题」「搜货号」这些后续屏本来也要抓）。
+ */
+async function dumpForCapture(serial, opts) {
+  const focus = await adb.currentFocus(serial);
+  if (focus && !uimap.isDewuFocus(focus)) {
+    return {
+      ok: false, blocked: true, focus, animOff: false,
+      why: `现在屏幕上不是得物 —— 前台是「${focus}」。${uimap.DEWU.entryHow}，停在发布页再点「抓取页面结构」`
+    };
+  }
+  // ★ 抓取要带上包名：uiautomator 对**持续动画的页面**（发布页首屏）永远抓不到，
+  //   带上包名后 dumpEx 才能退到 dumpsys 备用通道（见 adb.js 的 dumpViaDumpsys）。
+  const pkg = (String(focus || '').match(/^([a-zA-Z0-9_.]+)\//) || [])[1] || uimap.DEWU.pkg;
+  const d = await adb.dumpEx(serial, Object.assign({}, opts, { pkg }));
+  const onPublish = uimap.isPublishScreen(focus);
+  const focusNote = (!focus || onPublish) ? ''
+    : `★ 你现在抓的不是发布页首屏，而是「${focus}」—— 候选表是按**这一屏**猜的。`
+      + `如果这一步本来就要抓后面某一屏（填标题 / 搜货号），那是对的；`
+      + `如果本来想抓发布页首屏：${uimap.DEWU.entryHow}，停在那一屏再抓。`;
+  // ★ 如实告知：走了备用通道就得说清楚它少了什么（没有文字），不能让用户以为抓到的一样全
+  const viaNote = d.via === 'dumpsys'
+    ? '★ 这一屏是**动画页**（uiautomator 等不到 idle，实测连试十几次全败），已自动改用 dumpsys 抓：'
+      + '**控件 id / 坐标 / 是否可点**都有，但**没有文字** —— 候选表里按文字找的步骤要手动改或用 id 代替。'
+    : '';
+  // ★★ 2026-10-04 新增：把**抓取时的坐标系**一起带回去 —— 它会写进生成的定位表（`uimap.suggest` 的
+  //   `screen` 戳），运行时靠它判「这张表是不是在另一个坐标系里量的」（见 runReal 的坐标空间守卫）。
+  //   ★ 只在**确认前台是得物**时才量：坐标系跟着前台应用的方向走（得物竖屏 1080x1920 /
+  //     MuMu 桌面横屏 1920x1080，实测同一台机器两种都有）—— 不是在得物上量的尺寸，不能拿来给这张表背书。
+  //     读不到 focus 时量出来的尺寸归属不明 ⇒ 记 null，如实「没戳」，绝不编一个。
+  const screen = uimap.isDewuFocus(focus) ? await adb.uiSize(serial) : null;
+  return Object.assign({}, d, { focus, focusNote, onPublish, viaNote, screen });
+}
+
+/**
+ * 提交后等待退出编辑流程，避免下一条清理或强停中断当前上传。
+ * 本机实测：从草稿发布成功后会正常返回 DraftActivity，因此草稿箱只是返回页，不能判为存草稿失败。
+ * 此函数仅判断能否安全开始下一条，不代替账号侧发布和审核结果核验。
+ */
+async function waitLeftPublishFlow(serial, { timeoutMs = 15000, pollMs = 600, cancelled = null } = {}) {
+  const t0 = Date.now();
+  const seen = [];
+  let last = '', left = '';
+  for (;;) {
+    const f = String((await adb.currentFocus(serial)) || '');
+    if (f) {
+      last = f;
+      if (seen[seen.length - 1] !== f) seen.push(f);
+      const inDewu=f.split('/')[0]===uimap.DEWU.pkg;
+      if (inDewu && uimap.isDraftScreen(f)) {
+        return { ok: true, draft: true, waited: +((Date.now() - t0) / 1000).toFixed(1), focus: f, left: f, seen };
+      }
+      // 只接受已核实的正常返回页；其他得物Activity可能仍是剪辑、上传或加载。
+      if (inDewu && (uimap.isHomeScreen(f)
+        || /(?:modules\.personal\.ui\.home\.PersonalActivity|modules\.user\.ui\.MyActivity)$/.test(f))) { left = f; break; }
+    }
+    if (Date.now() - t0 >= timeoutMs) break;
+    if (typeof cancelled === 'function' && cancelled()) break;
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  return { ok: !!left, waited: +((Date.now() - t0) / 1000).toFixed(1), focus: last, left, seen };
+}
+
+async function runReal(row, item, copyRow, serial, map, ctx) {
+  require('./diagnostics').phase('准备发布', row.seq);
+  ctx.publishEntryReady = false;
+  ctx.submissionPending = '';
+  ctx.submissionUnsafe = false;
+  ctx.uiMapScreen = map.screen;
+  ctx.uiSize = null;
+  // 每条素材独立，上一条中断时遗留的输入状态不能带到新页面。
+  ctx.topicNeedsEnd = false;
+  const log = ctx.log || (() => {});
+  const cancelled = ctx.cancelled || (() => false);
+  // 大结论通道（见 logbus.tierOf / jobs.js）：工具里直接干跑没有 conclude 时退回 log，旧行为不变
+  const conclude = ctx.conclude || log;
+  const c = cfg();
+  // 上传/发布最长等多久（秒）。默认 180s：视频大文件上传慢，等不完就停批也比打断上传安全。
+  // 回归可把它调小，验证「先等上传结束，再走无损出口/才停批」这条顺序。
+  const uploadWaitMs = Math.max(2000, (Number(c.uploadWaitSec) > 0 ? Number(c.uploadWaitSec) : 180) * 1000);
+
+  // 0) 这条发视频还是图文：报告标了就以报告为准，没标按目录推断；两边都有又没标 → 这里必须拦住
+  const kind = rowKind(row, item);
+  if (!kind) throw new Error('判不了这条该发图文还是视频：这个叶子里图和视频都有，报告里也没标「内容类型」');
+  const isVideo = kind === 'video';
+  const mediaWord = isVideo ? '视频' : '图';
+  row.kind = kind;
+
+  // 1) 推素材 + 把素材**写进媒体库**（不写库，得物相册里根本看不到这条）
+  const media = (item.files || []).filter(f => f.type === (isVideo ? 'video' : 'image'));
+  if (!media.length) throw new Error(`这条按「${isVideo ? '视频' : '图文'}」发，但没有可推的${mediaWord}片文件`);
+
+  // ★★ 2026-10-04（第四十轮）**0b) 「回主线」守卫 —— 必须排在清相册之前**。
+  //   为什么非做不可（真机实测）：一条内容发完之后，得物停在哪儿是**不确定的**
+  //     （个人主页 / 相册页 / 发布成功页），而下一条的第一步是「底部点『我』」那个**固定坐标**
+  //     —— 只有 App 在首页时它底下才是底部导航。停在别处时那个坐标点下去就是乱点。
+  //     ⇒ 用户看到的「第二条永远拉不起来」。
+  //   ★ 顺序：守卫在**清相册/推素材之前** ⇒ 拦下时连素材都不推（不白跑几十秒）。
+  //   ★ 失败就**如实抛错**，绝不"当作没这回事继续往下点"（不知道自己在哪一屏时点固定坐标＝乱点）。
+  //   2026-10-14：历史强停恢复已禁止。草稿箱也是有效入口，连续发布直接沿用已有返回页。
+  // 在真实执行入口加固，覆盖内置表、导入旧表和调用方传入表。
+  ctx.confirmSelection = null; // 每条素材重新建立选材观测，不沿用上一条状态。
+  const shape = require('./uimapshape');
+  let selectedSteps = uimap.stepsFor(map, isVideo).slice();
+  if (isVideo && !(map.videoSteps || []).length) {
+    selectedSteps = selectedSteps.map(step => {
+      // 复用图文的位置，不能复用图文的目标屏和图片数量。
+      if (step.action === 'transition' && step.until === shape.IMAGE_TARGET) return shape.videoTransition();
+      if (step.action === 'tapId' && step.value === 'com.shizhuang.duapp:id/flThumbSelect' && step.count === '${imageCount}') {
+        return { ...step, count: '${videoCount}' };
+      }
+      return step;
+    });
+  }
+  const stepKey = isVideo ? 'videoSteps' : 'steps';
+  const steps = shape.harden({ [stepKey]: selectedSteps }).map[stepKey] || selectedSteps;
+  if (isVideo && !steps.some(step => step.action === 'videoCover'
+    || step.action === 'tapId' && /:id\/tv_skip$/.test(step.value || '')
+    || step.action === 'tapXY' && String(step.value).replace(/\s/g, '') === '820,1857')) {
+    const transitionIndex = steps.findIndex(step => step.action === 'transition' && step.until === shape.VIDEO_TARGET);
+    if (transitionIndex >= 0) steps.splice(transitionIndex + 1, 0, { name: '选择并核验视频封面', action: 'videoCover' });
+  }
+  // 草稿箱本身有发布新动态入口。复用已有返回页信息和定位步骤，下一条无需回首页。
+  const draftEntry = steps.findIndex(step => step.action === 'tapId' && step.value === uimap.DEWU.draft.exitId
+    && step.whenOn === uimap.DEWU.draft.titleId);
+  let entryFocus = '';
+  // ★★ 2026-10-17 提速：上一步被守卫跳过时，把那一屏的结构交给下一步（同屏不重复抓）。
+  let carryXml = '';
+  const pullHome = async () => {
+    row.status = '回主线';
+    if (ctx.onRow) ctx.onRow(row);
+    // ★ 别在这里自己先读一次 currentFocus —— 那会把「转场瞬间读不到」这个现场吃掉，
+    //   让守卫误判成「明确知道停在别处」从而瞎启动 App。守卫返回的 `from` 就是它看到的起点。
+    const knownReturn = ctx.publishReturnFocus;
+    ctx.publishReturnFocus = '';
+    // ★★ 2026-10-17：「备用入口试发」必须从首页起步。
+    //   真机现场：停在草稿箱里点试发 ⇒ 入口直接沿用草稿箱的「发布新动态」，
+    //   动态流相机那一段**一步都没走**，测出来的结论对线上无主页账号没有意义；
+    //   先回首页再点试发 ⇒ 才走「我 → 没主页按钮 → 回首页 → 动态 → 相机」。
+    //   线上真实起点就是首页 ⇒ 试发的起点也固定成首页，不接受草稿箱。
+    const mayStartInDraft = draftEntry >= 0 && !ctx.forceAlternateEntry;
+    const entryJudge = f => uimap.isHomeScreen(f) || (mayStartInDraft && uimap.isDraftScreen(f));
+    if (ctx.forceAlternateEntry && knownReturn && uimap.isDraftScreen(knownReturn)) {
+      log('备用入口试发：当前停在草稿箱，先回首页走动态流相机（不沿用草稿箱的「发布新动态」）', 'info');
+    }
+    const g = knownReturn && entryJudge(knownReturn)
+      ? { ok: true, focus: knownReturn, started: false }
+      : await adb.ensureApp(serial, {
+      pkg: uimap.DEWU.pkg,
+      activity: uimap.DEWU.launchActivity,
+      want: uimap.DEWU.homeActivity,
+      judge: entryJudge,
+      allowForceStop: false,
+      // 收掉上一次中断留下的发布页时要让用户看见（内容进了草稿，不是被丢掉）。
+      onNote: m => log(m, 'warn'),
+      timeoutMs: Number(c.ensureAppTimeoutMs) > 0 ? Number(c.ensureAppTimeoutMs) : 30000,
+      uploadWaitMs
+    });
+    entryFocus = g.focus || '';
+    if (!g.ok) {
+      // ★★ 2026-10-17（用户口径：入口失败必须自动解决，不许让整条发布停在这里）：
+      //   App 内返回收不回来（上一次断在发布页/相册页/编辑页、页面弹窗、深页回不去）时，
+      //   再走最后一条恢复：确认没有上传 ⇒ 自动重启得物并等回首页/草稿箱。
+      //   「正在上传」时 forceRecoverHome 仍会先等它结束，绝不会打断上传。
+      log(`${row.dir}：入口收不回来（${g.why || '未知原因'}），自动重启得物再试一次`, 'warn');
+      const hard = await adb.forceRecoverHome(serial, {
+        pkg: uimap.DEWU.pkg, activity: uimap.DEWU.launchActivity, want: uimap.DEWU.homeActivity,
+        judge: entryJudge,
+        onNote: m => log(m, 'warn'),
+        timeoutMs: Number(c.ensureAppTimeoutMs) > 0 ? Number(c.ensureAppTimeoutMs) : 30000,
+        uploadWaitMs
+      });
+      if (!hard.ok) {
+        throw new Error('没能准备得物首页或草稿箱发布入口：' + (g.why || '未知原因')
+          + '；自动重启得物也没恢复：' + (hard.why || '未知原因')
+          + ' —— 这一步不许跳过：定位表第一步是**固定坐标**点底部导航，停在别的页面上那个坐标底下不是底部导航。');
+      }
+      entryFocus = hard.focus || '';
+      log(`${row.dir}：已自动重启得物并回到发布入口（${entryFocus || '已确认'}）`, 'ok');
+      return hard;
+    }
+    if (g.started) {
+      log(`${row.dir}：之前不在首页，已准备发布入口（之前的页面：${g.from || '读不到'}）`, 'info');
+    }
+    return g;
+  };
+  await pullHome();
+
+  // ★★★ 2026-10-04 新增：**坐标空间守卫**（用户问「为啥你有具体坐标老是会点偏」）。
+  //
+  // 机制（都是本机 MuMu 12 实测出来的，不是推理）：
+  //   · 定位表里的 `tapXY` 是**写死的绝对坐标**，只在「抓表时那个坐标系」里成立；
+  //   · 那个坐标系由**当前前台应用的方向 / 模拟器分辨率**决定 —— 同一台机器上实测两种都出现过：
+  //       得物（竖屏锁定，发布全程都是它在前台）→ `dumpsys window displays` 的 `cur=1080x1920`，
+  //       同时 `screencap` 的 PNG 是 1080x1920、dump 的 bounds 最大 y=1919；
+  //       MuMu 桌面（横屏）在前台 → 同一命令变成 `cur=1920x1080`，PNG 与 bounds 全部变 1920x1080。
+  //   · **`input tap` 对越界坐标不报错** —— 实测在 1920x1080 的屏上 `input tap 945 1869` 返回 rc=0、
+  //     一个字都不说、什么都没点到。所以坐标系一旦不对，表现是「每一步都安静地点偏」，
+  //     日志上一条错都没有 —— 这正是「有具体坐标却老点偏」的机制。
+  //   ⇒ 两层，各管一半：
+  //     ① 表里记的抓取尺寸 vs 当下尺寸对不上（早报；连「坐标仍落在屏内但整体指错元素」也拦得住）；
+  //     ② 逐个坐标越界（兜底；也覆盖老表 —— 老表没有 screen 戳）。
+  //   ★ 为什么读尺寸**必须在这里**（pullHome 之后、推素材与清相册之前）：
+  //     坐标系跟着前台应用走，在得物没到前台时读会读到**桌面**的坐标系，
+  //     把一张本来正确的表判成「对不上」—— 假报警与漏报一样是灾难。
+  //     放这儿还顺带满足「fail fast」：坐标系不对时，一个像素都不点、一张素材都不推。
+  // ★ 挑哪一套步骤的判据抽到了 uimap.stepsFor（纯函数）：视频没单独配 videoSteps 就复用图文那套。
+  //   抽出去是为了让回归能**喂输入验语义**，而不是拿正则去匹配这一行长什么样（重构一次就误报一次）。
+  const fixedPts = uimap.tapPointsOf(steps);
+  if (fixedPts.length) {
+    ctx.uiSize = await stableCoordinates(serial, map.screen, ctx);
+    const liveSize = ctx.uiSize;
+    const mm = uimap.screenMismatch(map.screen, liveSize);
+    if (mm.mismatch) {
+      throw new Error(`UI 定位表的坐标系和这台设备对不上：${mm.why}。`
+        + `表里 ${fixedPts.length} 个写死的坐标（tapXY）会**整体点偏**，`
+        + `而 input tap 对点偏/越界不报错（实测 rc=0，什么都不点）⇒ 这里必须拦下，不许硬点。`
+        + `两条路：① 把模拟器调回抓表时的分辨率与方向（比如得物是竖屏锁定的，让得物在前台量一次即可）；`
+        + `② 停到得物发布页重新「抓取页面结构」→ 导入（新表会带上抓取时的坐标系）。`);
+    }
+  }
+
+  // 只并行已知的浏览导航。自定义步骤、发布入口、草稿处置、输入均不跨越清理屏障。
+  const preparedSteps=new Set(), navSteps=[], absentDialogs=[];
+  // ★★ 2026-10-16：强制备用入口（「备用入口试发」模块）时这段**照常收集、照常点「我」**。
+  //   为什么不跳过：线上无主页按钮的账号，正是先点「我」、停在个人页、在**那里**才发现没有主页按钮，
+  //   然后由 openPublishEntry 按返回键回首页再点「动态」。跳过「我」就等于把线上独有的一整截
+  //   （个人页 → 返回首页）从测试里删掉 —— 那样测出来的结论不能用。
+  //   强制只体现在**一个地方**：runStep 里把「主页」那一步当成找不到（见那段注释）。
+  if (uimap.isHomeScreen(entryFocus)) {
+    for(const step of steps) {
+      if(step.action==='tapId'&&step.value==='com.shizhuang.duapp:id/tvCancel'&&step.whenOn===step.value) {
+        absentDialogs.push(step); continue;
+      }
+      const browseId=step.action==='tapId'&&['com.shizhuang.duapp:id/tab_user','com.shizhuang.duapp:id/tvGoHomePage'].includes(step.value);
+      const browsePoint=step.action==='tapXY'&&/^底部.*我/.test(step.name||'')&&step.whenNotOn==='com.shizhuang.duapp:id/rlPublish';
+      if(!browseId&&!browsePoint)break;
+      if(/\$\{|\bwhen\b/.test(step.value||'')||step.when||step.whenNot)break;
+      navSteps.push(step);
+    }
+  }
+  let canOverlap=navSteps.length>0 && ctx.publishEntryRoute !== 'camera';
+  if(canOverlap&&absentDialogs.length) {
+    const page=await adb.dumpEx(serial,{pkg:uimap.DEWU.pkg,retries:0,allowAnimOff:false});
+    canOverlap=page.ok&&!/tvCancel|是否继续编辑|保存草稿|放弃编辑/.test(page.xml||'');
+  }
+  let preparation;
+  if(canOverlap) {
+    let aborted=false, navigationError=null;
+    // ★★★ 2026-10-14（rich 四连失败后收紧）：导航**不在清理期间并行**。
+    //   旧写法在 clearAlbum 还在 rm 的时候就点「我/主页」，而上一条已发布视频可能正在
+    //   个人主页自动播放、握着解码句柄 —— 清理期间一碰界面，句柄就被继续拉住，
+    //   rm 永远 busy（现场：0.3~0.7s 就报 busy，四连失败）。
+    //   现在：清理收敛后才启动导航，与推送/索引重叠，进发布入口前统一等待。
+    //   省时效果不变（导航 6~11s 覆盖在推送索引里），但清理阶段绝不发界面动作。
+    const branchCancelled=()=>cancelled()||aborted||!!navigationError;
+    let navigation=null;
+    const startNavigation=()=>{
+      if(navigation)return navigation;
+      navigation=require('./diagnostics').isolatedPhase('准备个人主页',row.seq,async()=>{
+        for(const step of navSteps) {
+          if(branchCancelled())throw new Error('发布已取消');
+          const result = await runStep(serial,step,{}, {...ctx,cancelled:branchCancelled,deferPublishEntry:true});
+          // 延后的步骤不能标成已完成，主流程会在素材就绪后使用原 ctx 执行。
+          if (result && result.deferred) break;
+          preparedSteps.add(step);
+        }
+        for(const step of absentDialogs)preparedSteps.add(step);
+      }).catch(error=>{navigationError=error;});
+      return navigation;
+    };
+    const awaitNavigation=async()=>{ if(navigation)await navigation; if(navigationError)throw navigationError; };
+    try {
+      preparation=await albumready.prepare(serial,item,row,{...ctx,publishConfig:c,cancelled:branchCancelled,
+        startNavigation,awaitNavigation});
+    } catch(error) {
+      const primaryNavigationError=navigationError;
+      aborted=true;if(navigation)await navigation;
+      throw primaryNavigationError&&!cancelled()?primaryNavigationError:error;
+    }
+    log(`${row.dir}：相册清理完成，个人主页导航已收敛，之后才进入发布入口`, 'info');
+  } else preparation=await albumready.prepare(serial,item,row,{...ctx,publishConfig:c});
+  const { remotes, remoteDir } = preparation;
+  // ★★ 2026-10-16：「备用入口试发」**没有**单独的开入口段 —— 上面那个
+  //   `(!exact.length || ctx.forceAlternateEntry)` 已经让「主页」那一步必走备用分支，
+  //   由 runStep → openPublishEntry 自己接管（与线上无主页账号同一个调用点、同一段代码）。
+  //   原来这里有一段「素材就绪后直接 openPublishEntry」，那会让试发变成一条**线上不存在的**捷径：
+  //   线上是"点了我 → 在个人页发现没有主页按钮 → 回首页 → 点动态 → 点相机"，
+  //   试发却是"素材好了 → 直接点相机"，中间那一截线上独有的路（个人页→回首页）根本没测到。
+  //   两段一对比就知道该删哪一段：测的是线上那条，就不能给测试留一条更短的路。
+  // 只复用本批已实际走通的入口；返回草稿箱时沿用它的出口，不绕回首页。
+  if (ctx.publishEntryRoute === 'camera' && !uimap.isDraftScreen(entryFocus)) {
+    require('./diagnostics').phase('备用发布入口', row.seq);
+    log('本批已确认备用入口可用，直接使用动态流相机入口', 'info');
+    await openPublishEntry(serial, ctx);
+  }
+
+  // 2) 按 UI 定位表走真实界面。
+  //    ★ 2026-10-02 用户实测：**图文和视频的发布位置是一样的**（入口、相册页签、编辑页同一套），
+  //      所以 videoSteps 没单独配时**直接复用 steps**，不再拦下。
+  //      videoSteps 仍然保留：哪天真机改版、视频那条路跟图文不一样了，单独配一套就能覆盖。
+  //    ★ 2026-10-04：这一组 steps 在**上面坐标空间守卫**那里就已经算好了（同一个判据，只算一次）——
+  //      两处各算一遍迟早不一致（改了一处、另一处还在按老规矩挑表）。
+  const reuseForVideo = isVideo && !(map.videoSteps || []).length;
+  if (reuseForVideo && steps.length) {
+    log(`${row.dir}：这条是视频，UI 定位表没单独配 videoSteps —— 按「图文那套位置」发（图文与视频位置一样，实测）`, 'info');
+  }
+  if (!steps.length) {
+    throw new Error('UI 定位表是空的 —— 到「设置 → 高级设置」点「抓取页面结构」'
+      + `（抓之前先把模拟器停在得物发布页：${uimap.DEWU.entryHow}），把生成的候选表核对后导入，再发。`);
+  }
+
+  const preparedCopy = topicinput.prepare(copyRow || {});
+  const data = {
+    title: (copyRow && copyRow.title) || '',
+    body: preparedCopy.body,
+    sku: item.sku || '', color: item.color || '',
+    // 相册里按文件名点选时用：要填**推上去之后**的文件名（含中文的名字在推送时会被清洗成下划线），
+    // 拿本地原名去匹配是匹配不到的
+    videoName: remotes[0] ? path.basename(remotes[0]) : '',
+    // ★ 「一条内容发多张图」靠它：这个叶子里**有几张图** ⇒ 定位表写 ${imageCount} 就能一次点前 N 格。
+    //   与 copywriter.imagePartsOf 同一判据：只看 type==='image'（视频不算图）。
+    //   读不到清单时是 0 ⇒ 用到 ${imageCount} 的那一步会**当场报错**，不会默默按 1 张发。
+    imageCount: (item.files || []).filter(f => f && f.type === 'image').length,
+    // ★ 定位表里「切到本工具专属相册」那一步用：得物相册下拉里的相册名 = 设备上的目录名。
+    albumName: remoteDir.split('/').filter(Boolean).pop(),
+    videoCount: (item.files || []).filter(f => f && f.type === 'video').length
+  };
+  preparedCopy.topics.forEach((t, i) => { data['topic' + (i + 1)] = t; });
+  // ★ 好物 1~3 的货号/颜色也进占位符（发布单列名：好物1货号 / 好物1颜色 … 好物3货号 / 好物3颜色，最多 3 组）。
+  //   没有 item.goods 的老数据（本地扫出来的条目）按「主货号/主颜色」兜底 —— 与 sheet.buildRows 同一判据，
+  //   否则定位表里的好物段会对**每一行**都判成「没有好物」而整段静默跳过（少关联商品，还不报错）。
+  const goodsList = (Array.isArray(item.goods) && item.goods.length)
+    ? item.goods
+    : [{ sku: item.sku, color: item.color }];
+  for (let gi = 0; gi < 3; gi++) {
+    const g = goodsList[gi] || {};
+    data['goods' + (gi + 1) + 'Sku'] = g.sku || '';
+    data['goods' + (gi + 1) + 'Color'] = g.color || '';
+  }
+
+  // ★★ 2026-10-04 新增：记住「紧邻的上一步点的是哪个输入框」——紧跟其后的 input 步拿它做**回读校验**
+  //   （见 runStep 的 input 分支 / adb.readTextOf）。
+  //   为什么只认「紧邻」：话题那几步（topic1..5）是往**正文框**里接着追加的，它们的上一步是另一个
+  //   input（不是 tapId）⇒ 天然不会拿正文全文去比对某一小段话题，不会误报。
+  //   被屏幕守卫跳过（rs.skipped）的步不算「点过」，所以置 ''。
+  let lastTapId = '';
+  const entrySteps = uimap.isDraftScreen(entryFocus) && draftEntry >= 0 ? steps.slice(draftEntry) : steps;
+  if (entrySteps !== steps) log(`${row.dir}：沿用草稿箱的「发布新动态」入口，不退出得物、不绕回首页`, 'info');
+  for (const raw of entrySteps) {
+    if(preparedSteps.has(raw))continue;
+    if (cancelled()) throw new Error('已取消');
+    if (ctx.publishEntryReady && isAccountEntryStep(raw)) {
+      log(`${row.dir}：跳过「${raw.name || raw.value}」（已由备用入口进入发布流程）`, 'info');
+      continue;
+    }
+    let step = topicinput.mark(raw, uimap.fill(raw, data));
+    // 老用户定位表同样升级，不能只改出厂表让已安装的机器继续跳过封面。
+    if (isVideo && ((step.action === 'tapXY' && String(step.value).replace(/\s/g, '') === '820,1857')
+      || (step.action === 'tapId' && /:id\/tv_skip$/.test(step.value || '')))) {
+      step = { name: '选择并核验视频封面', action: 'videoCover' };
+    }
+    // ★ 条件步骤（when / whenNot）：发布单里「好物2 / 好物3」常常是空的，而「点关联好物 → 搜货号 → 选商品」
+    //   是一整段 ⇒ 空着不跳过会把搜索页打开却不选商品，后面每一步全崩。
+    //   跳过必须**说出来**：静默少点一步，真机上表现为「下一条莫名失败」，最难查。
+    if (!uimap.condOk(step, data)) {
+      // ★★ 必须点名**真正没成立**的那一半（uimap.condWhy），不能「写了 when 就报 when 空」：
+      //    实测这条日志写过「占位符 goods1Sku 是空的」，而那一行明明填了货号 ——
+      //    真因是 whenNot（颜色有值）。报错点名一个已经满足的条件，等于把人往反方向带。
+      const why = uimap.condWhy(step, data) || '条件不成立（when / whenNot）';
+      log(`${row.dir}：跳过「${step.name || step.value}」（${why}）`, 'info');
+      continue;
+    }
+    // 守卫步骤先检查页面；步骤名不能让用户误以为已经点击或放弃了草稿。
+    const stepLabel = step.whenOn === uimap.DEWU.draft.titleId && step.value === uimap.DEWU.draft.exitId
+      ? '检查草稿箱（出现时进入相册）'
+      : step.whenOn === uimap.DEWU.resumeDialog.dismissId && step.value === uimap.DEWU.resumeDialog.dismissId
+        ? '检查继续编辑提示（出现时放弃旧内容）' : step.name;
+    row.status = stepLabel;
+    if (ctx.onRow) ctx.onRow(row);
+    // ★ 交给 runStep 的 input 分支做回读校验（只有紧邻的上一步真是 tapId 才非空）
+    ctx.inputCheckId = lastTapId;
+    // ★★ 2026-10-04 逐步计时（用户问「为什么选择素材花了 8 秒 / 点关联好物花了 5 秒」）：
+    //   不靠推理，把每一步的**真实毫秒数**量出来。只有慢到会引起注意的（≥1.5s）才说，
+    //   免得日志被一堆 0.1s 淹没。计时不含日志本身的开销（纯 runStep 前后取差值）。
+    const tStep = Date.now();
+    require('./diagnostics').phase('界面步骤 ' + String(stepLabel || step.action).replace(/[^\u4e00-\u9fffA-Za-z0-9 ·_-]/g, '').slice(0, 45), row.seq);
+    let rs;
+    try {
+      const submittingVideo = isVideo && (/^提交发布/.test(step.name || '') || step.submit === true
+        || (raw === steps[steps.length - 1] && step.action === 'tapText' && step.value === '发布'));
+      if (submittingVideo) await require('./videocover').verify(serial, ctx);
+      rs = await runStep(serial, step, data, ctx, carryXml);
+      const pickedGoods = step.action === 'tapCardText'
+        || step.action === 'tapId' && step.value === 'com.shizhuang.duapp:id/ivProduct';
+      if (!(rs && rs.skipped) && pickedGoods) {
+        try {
+          // 选完好物后不能只等编辑页回来：得物可能点空、搜索为空、或识别结果把页面拉回。
+          // 先确认容器里重新出现 ivDelete（用户口径：没挂上就是没选上），再确认编辑页返回。
+          // 以前只有名字命中「好物N · 选结果第1格」才校验；旧表/改名后同样的点选会漏检，
+          // 表现还是卡到后面找不到 etTitle，必须对每一种已点选的好物步骤统一收紧。
+          await runStep(serial, { name: '选择好物后校验确实挂上', action: 'waitId', value: 'com.shizhuang.duapp:id/ivDelete', timeout: 8000 }, {}, ctx);
+          await runStep(serial, { name: '选择好物后返回文案编辑页', action: 'waitId', value: 'com.shizhuang.duapp:id/etTitle', timeout: 30000 }, {}, ctx);
+        } catch (error) {
+          error.code = 'PUBLISH_TRANSITION_UNCONFIRMED';
+          throw error;
+        }
+      }
+    } finally {
+      const used = Date.now() - tStep;
+      if (ctx.stepTiming) ctx.stepTiming.push({ name: step.name || step.value, ms: used, row: row.dir });
+      if (used >= 1500) {
+        log(`${row.dir}：「${step.name || step.value}」耗时 ${(used / 1000).toFixed(1)}s`, 'info');
+      }
+      // 被守卫跳过 = 这一屏没被碰过 ⇒ 下一步的守卫可以直接用这份结构（省一次 dump）。
+      carryXml = (rs && rs.skipped && !step.topicInput && rs.why !== '已由备用入口进入发布流程')
+        ? (ctx.lastGuardXml || '') : '';
+    }
+    // ★ 记下这一步**实际点成功**的输入框 id（被守卫跳过的不算），供紧随其后的 input 步回读校验
+    //   ★★ 注意判据别写反：`runStep` 对 tapId/wait/input 这些分支是 `return;`（**返回 undefined**），
+    //      只有屏幕守卫跳过时才返回 `{skipped:true}`。所以「没被跳过」是 `!(rs && rs.skipped)`
+    //      —— 写成 `rs && !rs.skipped` 会**永远为假**，回读整段静默失效（这个坑我当场踩过一次）。
+    lastTapId = (step.action === 'tapId' && !(rs && rs.skipped)) ? String(step.value || '') : '';
+    // 2026-10-12 用户确认：实际点击提交发布即记成功，不再按 Activity 判断结果。
+    const submit = /^提交发布/.test(step.name || '') || step.submit === true
+      || (raw === steps[steps.length - 1] && step.action === 'tapText' && step.value === '发布');
+    if (submit && /^tap(?:Id|Text|Desc|XY)$/.test(step.action)) {
+      if (rs && rs.skipped) throw new Error('「提交发布」被屏幕守卫跳过，未点击发布按钮。');
+      log(`${row.dir}：已实际点击提交发布，等待退出编辑流程后再开始下一条`, 'info');
+      require('./diagnostics').phase('等待提交退出', row.seq);
+      // ★★ 2026-10-17 用户口径（这一条覆盖之前所有复杂判定）：
+      //   「点了提交就算成功，点完这个页面就会跳开；没跳开才=不成功，复点就行了」。
+      //   所以这里不再等 30s + 120s，而是：
+      //     ① 等一个很短的窗口（默认 6s）让页面自己跳开 ⇒ 跳开 = 成功；
+      //     ② 没跳开、这一屏也不显示「正在上传」⇒ 这一下没点中，**复点同一颗按钮**（最多 3 下）；
+      //     ③ 一看到「正在上传/发布中」⇒ 只观察不按键，等它结束（上传慢不是没点上，复点会重复发）；
+      //     ④ 复点到上限还没跳开 ⇒ 这一条失败，继续下一条（不停整批）。
+      // 至少给 4s：真机上「点完跳开」通常 1s 内，但偶尔有 2-3s 的转场；
+      // 短于 3s 会把「慢一点但已经发出去」误判成没点中，反而复点成重复帖。
+      const quickWaitMs = Math.min(8000, Math.max(4000, Number(c.submissionWaitMs) || 6000));
+      let settle = await waitLeftPublishFlow(serial, { timeoutMs: quickWaitMs, cancelled });
+      let clicks = 1;
+      while (!settle.ok && clicks < 3 && !cancelled()) {
+        // 先看这一屏是不是在真上传：在上传就绝不复点（那会重复发）。
+        const peek = await adb.waitUploadFinished(serial, { pkg: uimap.DEWU.pkg, timeoutMs: 3000 });
+        if (!peek.ok) break;                    // 正在上传 ⇒ 交给下面等它结束
+        if (peek.left) { settle = await waitLeftPublishFlow(serial, { timeoutMs: 3000, cancelled }); if (settle.ok) break; }
+        // 停在上传/剪辑/加载这类中间页（不显示文字但在处理）⇒ 不复点，也不重启。
+        const f0 = String(peek.focus || settle.focus || '');
+        if (/(?:upload|clip|camera|album|edit|loading)/i.test(f0) && !/publish/i.test(f0)) break;
+        // 真正的「没点中」：页面完全没变，才处理遮挡并复点。
+        let pt = ctx.lastTapPoint;
+        try {
+          const page = await adb.dumpEx(serial, { pkg: uimap.DEWU.pkg, retries: 0, allowAnimOff: false });
+          const ns = page && page.ok ? uimap.parseNodes(page.xml) : [];
+          // ★★ 先看这一屏有没有变：变了（按钮变灰、出现「发布中/正在上传」、页面开始转场）
+          //   就说明这一下**已经被受理**，只是还没跳开 —— 这时补点就是重复提交，绝不点。
+          //   只有和点之前**一模一样**（同一批节点、同一批文字、同一批位置）才算「被吞了」。
+          // ★★ 2026-10-18：页面一模一样才判遮挡。先点后判，避免把页面上
+          // 不影响提交的侧栏/创作分析误当遮罩关掉；只有真正盖住提交按钮的
+          // 明确弹层才关闭，关闭后仅允许复点一次。
+          if (await overlayguard.dismiss(serial, ns, ctx,
+            { name: '提交发布' }, pt)) {
+            log(`${row.dir}：提交首击后页面未变化，发现遮挡，已关闭；复点提交按钮`, 'warn');
+            // 关闭弹层本身也会改变页面结构；必须重新建立“提交前基线”，
+            // 否则会把遮罩消失误判成提交已受理，导致谎报成功且不再复点。
+            const cleaned = await adb.dumpEx(serial, {
+              pkg: uimap.DEWU.pkg, retries: 0, allowAnimOff: false
+            });
+            // 只有拿到非空的干净页面，才能把它当作下一轮“提交是否被受理”的基线。
+            // 抓屏失败或空结构时保留点击前的基线，继续下一轮有限复点；
+            // 绝不能把空签名写进 lastTapSig（那会把任何页面都误判成“已受理”）。
+            const cleanNodes = cleaned && cleaned.ok ? uimap.parseNodes(cleaned.xml) : [];
+            const cleanSig = cleanNodes.length ? screenSig(cleanNodes) : '';
+            if (cleanSig) ctx.lastTapSig = cleanSig;
+            continue;
+          }
+          if (ctx.lastTapSig && screenSig(ns) !== ctx.lastTapSig) {
+            log(`${row.dir}：提交后页面有变化（已受理，等待转场，不再补点）`, 'info');
+            break;
+          }
+          const hit = ns.find(n => n.center && (
+            (step.action === 'tapId' && n.id === String(step.value))
+            || (step.action === 'tapText' && String(n.text || '').trim() === String(step.value))
+            || (step.action === 'tapDesc' && String(n.desc || '').includes(String(step.value)))
+          ));
+          if (hit) pt = { x: hit.center.x, y: hit.center.y };
+          else if (step.action !== 'tapXY') pt = null;
+          // 按钮已经变灰 = 得物正在受理，不能补点。
+          if (hit && hit.enabled === false) {
+            log(`${row.dir}：提交按钮已变成不可点（得物正在受理），不再补点`, 'info');
+            pt = null;
+          }
+        } catch (e) { /* 读不到结构就退回原坐标（tapXY）或放弃复点 */ }
+        if (!pt) break;
+        clicks++;
+        log(`${row.dir}：提交后页面没跳开（也不在上传），复点提交按钮（第 ${clicks}/3 下）`, 'warn');
+        const rr = await adb.tap(serial, pt.x, pt.y);
+        if (!rr.ok) { log(`${row.dir}：复点提交的回执未确认（${String(rr.stderr || '').trim() || '无输出'}）`, 'warn'); break; }
+        settle = await waitLeftPublishFlow(serial, { timeoutMs: quickWaitMs, cancelled });
+      }
+      if (!settle.ok && !cancelled()) {
+        // 复点完了还没跳开：先分清「还在上传」和「真失败」。
+        const up = await adb.waitUploadFinished(serial, {
+          pkg: uimap.DEWU.pkg, timeoutMs: uploadWaitMs,
+          onTick: s => { if (s && s % 15 === 0) log(`提交后上传仍在进行（已等 ${s}s），继续等待，不打断`, 'info'); }
+        });
+        if (up.ok) settle = await waitLeftPublishFlow(serial, { timeoutMs: 6000, cancelled });
+        if (!settle.ok && !up.ok) {
+          ctx.submissionUnsafe = true;
+          ctx.submissionPending = `已点击提交，但上传/发布持续 ${up.waited}s 仍未结束；停止后续条目，避免清理或重启打断上传，不自动重复提交。`;
+          log(ctx.submissionPending, 'warn');
+        } else if (!settle.ok) {
+          const stuck = String(up.focus || settle.focus || '');
+          if (/(?:upload|clip|camera|album|edit|loading)/i.test(stuck) && !/publish/i.test(stuck)) {
+            // 这种页面**绝不能**自动强停/重启（那会把还在跑的上传打断）—— 连现场回收都不做。
+            ctx.submissionUnsafe = true;
+            ctx.submissionPending = `已点击提交，但一直停在「${stuck}」这类上传/处理中间页，`
+              + '无法确认是否还在上传；停止后续条目，避免清理打断上传，不自动重复提交。';
+            log(ctx.submissionPending, 'warn');
+          } else {
+            // 复点了 3 下、页面仍不跳开 ⇒ 这一条没发出去。按失败处理，继续下一条。
+            const error = new Error(`提交后页面没有跳开：提交按钮已点 ${clicks} 下仍未退出发布流程（${stuck || '读不到'}）；`
+              + '这一条按失败处理，不再点击，继续下一条');
+            error.noRetry = true;
+            throw error;
+          }
+        }
+      }
+      ctx.publishReturnFocus = settle.ok ? settle.focus : '';
+      if (!settle.ok) {
+        if (!ctx.submissionPending) {
+          ctx.submissionPending = `已点击提交，但等待 ${settle.waited}s 后尚未确认退出编辑流程；停止后续条目，避免清理或重启打断上传，不自动重复提交。`;
+          log(ctx.submissionPending, 'warn');
+        }
+      } else {
+        log(`${row.dir}：已退出编辑流程${settle.draft ? '（返回草稿箱属于正常返回路径）' : ''}，可继续下一条`, 'ok');
+      }
+      return true;
+    }
+
+    // ★★ 屏幕守卫（whenOn / whenNotOn）判「这一屏不对」⇒ 这一步**没发任何点击**。
+    //   必须说出来：静默少点一步，真机上表现为「下一条莫名失败」，最难查。
+    if (rs && rs.skipped) {
+      log(`${row.dir}：跳过「${step.name || step.value}」（屏幕守卫：${rs.why}）`, 'info');
+    }
+  }
+
+  throw new Error('定位表未实际点击「提交发布」按钮，请检查定位表；本条未记为成功。');
+}
+
+/* ---------------- 模拟通道 ---------------- */
+
+async function runMock(row, ctx) {
+  const cancelled = ctx.cancelled || (() => false);
+  for (const st of STEPS) {
+    if (cancelled()) return 'cancelled';
+    row.status = st;
+    if (ctx.onRow) ctx.onRow(row);
+    await sleep(400, cancelled);
+  }
+  // ★★ 2026-10-03：这里原来是 `return Math.random() > 0.08;` —— 每次 8% 概率**随机失败**。
+  //    在没有「失败重试」的年代那点随机失败会被重试吃掉；现在「失败不重试」⇒ 它变成实打实的一条失败。
+  //    两个后果都不能接受，且都实测到了：
+  //      ① 用户跑一次模拟演示会莫名看到「发布失败」（模拟通道本来只是演练节奏 + 回写）；
+  //      ② 回归测试变成**概率性红**（smoke ⑦ 当场踩到：8% × 几十行 ⇒ 几乎必红）。
+  //    模拟通道不负责造故障；真故障路径由 adbtest 用真实通道覆盖（页面结构变了 → 必失败）。
+  return true;
+}
+
+/* ---------------- 主流程 ---------------- */
+
+const activeDevices = new Map();
+let deviceRunSequence = 0;
+async function run(state, ctx = {}) {
+  const publish = state.publish || {};
+  // 已完成的历史队列没有新内容可发时，必须在分配设备与碰设备之前明确拒绝。
+  // 否则会先做输入法/连接前置检查，甚至把零条执行包装成一次“发布成功”。
+  const queued = Array.isArray(publish.rows) ? publish.rows : [];
+  if (queued.length && !queued.some(row => !row || row.result !== '发布成功')) {
+    const error = new Error('没有待发布的素材：队列里的内容都已发布成功，无需重复发布');
+    error.code = 'PUBLISH_NO_PENDING';
+    throw error;
+  }
+  const serial = publish.mode === 'adb' ? (publish.device || cfg().device || '') : '';
+  if (serial && activeDevices.has(serial)) throw new Error('这台设备已有发布任务，等待当前任务完成后再发布，避免清理打断另一批素材');
+  const token = { order: ++deviceRunSequence };
+  if (serial) activeDevices.set(serial, token);
+  try {
+    // MuMu 会把同一实例暴露为多个端口。仅在另有批次运行时核对身份，
+    // 普通单批次不增加设备命令；后来的任务不能通过更换端口接管同一相册。
+    const earlier = serial ? [...activeDevices.entries()].filter(([s, t]) => s !== serial && t.order < token.order) : [];
+    if (earlier.length) {
+      const identity = async device => {
+        const r = await adb.shell(device, 'settings get secure android_id', { timeout: 3000 });
+        const value = String(r && r.stdout || '').trim().toLowerCase();
+        return r && r.ok && /^[0-9a-f]{8,}$/.test(value) ? value : '';
+      };
+      const ids = await Promise.all([serial, ...earlier.map(([s]) => s)].map(identity));
+      if (!ids[0] || earlier.some(([s, t], i) => activeDevices.get(s) === t && !ids[i + 1])) {
+        throw new Error('另有发布任务运行，暂时无法确认两个端口是否属于独立设备；等待当前任务结束后再发布，避免相册互相清理');
+      }
+      if (ids[0] && earlier.some(([s, t], i) => activeDevices.get(s) === t && ids[i + 1] === ids[0])) {
+        throw new Error('这台设备已有发布任务，另一个ADB端口属于同一模拟器，等待当前任务完成后再发布');
+      }
+    }
+    return await runBatch(state, ctx);
+  }
+  finally { if (serial) activeDevices.delete(serial); }
+}
+
+/**
+ * ★★ 2026-10-17（用户口径）：「一条内容的异常不许拖垮整批」。
+ *
+ * 这些错误的共同点：**只是这一条走不下去了**（入口没确认 / 转场没确认 / 内容没确认 /
+ * 找不到控件 / 相册被占），设备本身还在、下一条还能从头走一遍。以前它们一律 `stoppedReason` ⇒
+ * 后面的素材全部「未执行」，用户看到的是「一条没发成，剩下的一条都没发」。
+ * 现在改成：先收回现场重试一次，仍不行就把**这一条**记失败，收干净后继续下一条。
+ *
+ * 仍然会停整批的只剩两种（都属于「设备级、再试也是一样的结果」）：
+ *   · UI_COORDINATES：定位表坐标和当前屏幕不符，每条都会同样失败；
+ *   · 现场收不回来（发布页正在上传、或没有「不丢内容」的出口）——
+ *     这种情况下下一条的相册清理会打断正在上传的内容，绝不能硬来。
+ */
+/**
+ * 这一条失败后能不能收回现场再继续下一条？
+ *
+ * 除了「坐标整张表都对不上」（每条都会同样失败）和用户主动取消，**其余都按行级处理**：
+ * 没打错误码的步骤失败（找不到控件、点了没反应、输入回读不一致、提交按钮没点中……）
+ * 本质上都是「这一条走不下去了」，而不是设备坏了。收回现场失败才是停批条件（见 runBatch）。
+ * 为什么不在这里白名单收窄：漏掉一个新错误码的代价就是「一条失败、后面全不执行」，
+ * 而这正是用户明确不接受的行为。
+ */
+function rowRecoverable(error) {
+  if (!error) return false;
+  if (error.code === 'UI_COORDINATES') return false;
+  if (error.code === 'PUBLISH_CANCELLED' || /发布已取消/.test(String(error.message || ''))) return false;
+  return true;
+}
+
+/**
+ * 这一条失败后能不能「收回现场、重走一遍」？
+ *
+ * 比 rowRecoverable 更窄：相册/媒体清理类错误（ALBUM_*）只记这一条失败，**不重走**。
+ * 为什么（回归用例抓到的真问题）：第一次尝试里可能已经把 `.nomedia` 隔离标记写进去了，
+ * 第二次再跑时「隔离已确认 + 物理文件仍在」会被当成可接受状态直接放行 ——
+ * 等于把一个 rm 没删掉、还留在盘上的旧素材静默当成清干净了（以空库伪装清理成功）。
+ * 这类失败本身也不属于「页面没走到」，重走一遍不会让它变好。
+ */
+function rowRetryable(error) {
+  if (!rowRecoverable(error)) return false;
+  // 素材/相册就绪段（清理、推图、写库、排主图）自己打了 noRetry：见 albumready.noRetry。
+  if (error && error.noRetry) return false;
+  if (String((error && error.code) || '').startsWith('ALBUM_')) return false;
+  return true;
+}
+
+/** 一条内容最多走几次（默认 2：首轮 + 收回现场后重试一次）；`ctx.rowAttempts` 只给回归用 */
+function rowAttemptsOf(ctx, c) {
+  const raw = Number((ctx && ctx.rowAttempts) || (c && c.rowAttempts));
+  return Number.isFinite(raw) && raw >= 1 ? Math.min(3, Math.floor(raw)) : 2;
+}
+
+/**
+ * 把设备收回到「能重新走一遍入口」的起点（首页或草稿箱）。
+ *
+ * 复用 adb.ensureApp：它内部会先认发布页自己的返回确认条，只点「保存并退出」这种
+ * 不丢内容的出口；正在上传时一个键都不按。所以这里成功 = 现场是干净的，
+ * 失败 = 真的不能继续（调用方必须停批，不能拿下一批素材去冒险）。
+ */
+async function recoverScene(serial, ctx, log, why) {
+  const c = cfg();
+  const uploadWaitMs = Math.max(2000, (Number(c.uploadWaitSec) > 0 ? Number(c.uploadWaitSec) : 180) * 1000);
+  try {
+    const r = await adb.ensureApp(serial, {
+      pkg: uimap.DEWU.pkg, activity: uimap.DEWU.launchActivity, want: uimap.DEWU.homeActivity,
+      judge: f => uimap.isHomeScreen(f) || uimap.isDraftScreen(f),
+      allowForceStop: false,
+      onNote: m => log(m, 'warn'),
+      timeoutMs: Number(c.ensureAppTimeoutMs) > 0 ? Number(c.ensureAppTimeoutMs) : 30000,
+      uploadWaitMs
+    });
+    if (r.ok) {
+      // 下一条要重新观察入口/返回页，不能沿用失败那一条的缓存。
+      ctx.publishReturnFocus = '';
+      ctx.publishEntryRoute = '';
+      return { ok: true, focus: r.focus || '' };
+    }
+    // ★★ 2026-10-17（用户口径：不能因为一次页面收不回来就停整批）：
+    //   先试 App 内返回 + 页面自带的无损出口；仍收不回来时自动重启得物。
+    //   上传中会先等上传结束，绝不打断正在上传的内容。
+    if (log) log(`${why}：现场收不回来（${r.why || '未知原因'}），自动重启得物再试一次`, 'warn');
+    const hard = await adb.forceRecoverHome(serial, {
+      pkg: uimap.DEWU.pkg, activity: uimap.DEWU.launchActivity, want: uimap.DEWU.homeActivity,
+      judge: f => uimap.isHomeScreen(f) || uimap.isDraftScreen(f),
+      onNote: m => log && log(m, 'warn'),
+      timeoutMs: Number(c.ensureAppTimeoutMs) > 0 ? Number(c.ensureAppTimeoutMs) : 30000,
+      // 刚在上面那条路径已经按完整窗口等过一次上传了 ⇒ 这里只再确认一小段。
+      // 否则一次「一直上传」要连等两个 180s（用户口径：不许让人干等/以为卡死）。
+      uploadWaitMs: Math.min(uploadWaitMs, 15000)
+    });
+    if (hard.ok) {
+      ctx.publishReturnFocus = '';
+      ctx.publishEntryRoute = '';
+      return { ok: true, focus: hard.focus || '', restarted: true };
+    }
+    return { ok: false, why: (r.why || '未知原因') + '；自动重启得物也没恢复：' + (hard.why || '未知原因') };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+}
+
+async function runBatch(state, ctx = {}) {
+  // 返回页只属于当前批次；调用者复用 ctx 或换设备时必须重新观察入口。
+  ctx.publishReturnFocus = '';
+  ctx.publishEntryRoute = '';
+  // ★★ 2026-10-16：**强制走备用入口**（动态流相机）。
+  //   为什么要有它：本机账号有「主页」按钮 ⇒ 主入口永远能走通，备用入口在本机**没有真实触发条件**。
+  //   只让发布器「先找主页、找不到才退备用」的话，本机永远测不到备用那一段 —— 而远端
+  //   （无主页按钮的账号）走的正是那一段。所以给一个显式开关，从调用方传进来，
+  //   **不改默认行为**：不传就是原来的两条路线自动挑。
+  //   ★ 它只影响「走哪个入口」，不影响后面任何一步：依然是真实 publisher.run、真实设备、真实点击，
+  //     所以用它测出来的结果可以直接用于判断备用入口本身有没有问题。
+  ctx.forceAlternateEntry = !!(state.publish && state.publish.forceAlternateEntry) || !!ctx.forceAlternateEntry;
+  const log = ctx.log || (() => {});
+  // ★ 2026-10-05 用户口径「给用户只看大结论」：`log`（= ctx.log）现在一律是**过程明细**，
+  //   界面不显示；只有 `conclude`（= ctx.conclude）那几句会出现在用户眼前。
+  //   这里准备一个兜底：工具/干跑脚本传进来的 ctx 没有 conclude 时，退回 log（老行为，别抛）。
+  const conclude = ctx.conclude || log;
+  // ★ 2026-10-03 提速：批次内共享「哪一步这一屏不会 idle」的缓存（见 runStep 的 wantAnimOff）。
+  //   只在这一次发布里有效，不落盘 —— 下次发布会重新学一遍（设备/App 版本变了也自然失效）。
+  if (!ctx.animOffSteps) ctx.animOffSteps = {};
+  // ★ 2026-10-04：逐步计时用的收集器（调用方传进来就写进去；不传就是一个丢弃用的数组）。
+  //   界面上「本次发布各步耗时」那张表读的就是它。
+  if (!ctx.stepTiming) ctx.stepTiming = [];
+  const progress = ctx.progress || (() => {});
+  const cancelled = ctx.cancelled || (() => {});
+  const onRow = ctx.onRow || (() => {});
+  const c = cfg();
+  const uploadWaitMs = Math.max(2000, (Number(c.uploadWaitSec) > 0 ? Number(c.uploadWaitSec) : 180) * 1000);
+  const mode = (state.publish && state.publish.mode) || 'mock';
+  // 正式安装版不能在设备未就绪时退回模拟发布。
+  if (require('electron').app.isPackaged && mode !== 'adb') {
+    throw new Error('设备尚未准备好，不能发布。请连接模拟器并通过「检查能不能发布」后重试。');
+  }
+  // ★★ 2026-10-03：这里**绝不许**再兜底任何硬编码序列号（此前是 '127.0.0.1:5555'，再前是 'emulator-5554'）。
+  //   后果：没选设备也能“跑起来”，实际拿一台**不存在**的设备去发，界面与台账却是绿的。
+  const serial = (state.publish && state.publish.device) || c.device || '';
+  if (mode === 'adb' && !serial) {
+    throw new Error('还没选设备：先点「扫描设备」，把模拟器加入列表并点「选用」，再开始发布。');
+  }
+  // ★★ 2026-10-03 事故修复（真机实测误发 2 条内容）：这里原来是 `const map = c.uiMap;` —— **只读配置**。
+  //   而 tools/pubsim.js（真机干跑）以为自己传进来的 `state.publish.uiMap`（**已剔除「提交发布」那一步**）
+  //   会被用上，其实被**静默忽略** ⇒ 干跑「不点提交」的意图完全失效 ⇒ **提交被真点了，内容真的发出去了**
+  //   （账号个人主页动态列表里实测出现 2 条「干跑不发布·图文标题」，用户手动删除）。
+  //   ⇒ 让这个参数名副其实：调用方给了就用调用方的，没给才退回配置。
+  //   （真机发布路径 src/main/jobs.js **不传** state.publish.uiMap ⇒ 行为与以前一字不差。）
+  const map = (state.publish && state.publish.uiMap) || c.uiMap;
+
+  // 强制备用入口时先校验定位表里确实有备用入口要用到的步骤，缺了就当场说清楚，
+  // 不要跑到一半才发现没有那一跳。
+  if (mode === 'adb' && ctx.forceAlternateEntry) {
+    const hasTrends = (map.steps || []).some(s => s.action === 'tapId' && s.value === 'com.shizhuang.duapp:id/tab_trends');
+    if (map.steps && map.steps.length && !hasTrends) {
+      // 备用入口自己会点「动态」tab，定位表里那一步不是必需的 —— 这里只作提示，不拦。
+      log('强制备用入口：定位表里没有「动态」页签步骤，仍按内置的动态流相机入口走', 'info');
+    }
+  }
+
+  if (mode === 'adb' && !(map && map.steps && map.steps.length)) {
+    throw new Error('真实通道需要先配 UI 定位表：把模拟器停在得物发布页 —— 推荐走底部「我」→ 右上角「主页」→「发布新动态」（3 跳，入口都带文字，稳）；也可以点动态流右上角那个没文字的相机图标（1 跳），'
+      + '在「设置 → 高级设置」点「抓取页面结构」，改好后导入 uiMap.json');
+  }
+  if (mode === 'adb') {
+    const ime = await adb.ensureKeyboard(serial);
+    if (!ime.ok) {
+      throw new Error(`设备缺少可用的内置中文输入法，已阻止发布：${ime.error}（${ime.step}）。重新连接设备后程序会自动重试。`);
+    }
+  }
+
+  const rows = (state.publish && state.publish.rows && state.publish.rows.length)
+    ? state.publish.rows
+    : sheet.buildRows(state, { intervalSec: gapSecFor('image', c) })
+      .map((r, i) => ({ seq: i + 1, id: state.items[i] ? state.items[i].id : String(i + 1), dir: r[1], goods: 1, images: 0, startAt: '', status: '排队', result: '', reason: '' }));
+  // 历史队列里可能已经全部发布成功。此时再点「开始发布」既没有新内容可发，
+  // 也不能记成一次成功；在碰设备之前明确停下，避免误报和多余操作。
+  if (!rows.some(row => !row || row.result !== '发布成功')) {
+    const error = new Error('没有待发布的素材：队列里的内容都已发布成功，无需重复发布');
+    error.code = 'PUBLISH_NO_PENDING';
+    throw error;
+  }
+  // 批次名跟着日志走：「重导出日志」要能按批次导出（真机日志行里也带批次）
+  const batch = (state.publish && state.publish.batch) || `批${wp.stamp()}`;
+  // 归属：优先用 ctx 传进来的（jobs 已按账号权限校验过），退回批次上记录的那一个。
+  // 两者都没有就是「未标品牌」—— 如实标出来，绝不拿某个品牌顶上（顶上了统计就是错的）
+  const who = {
+    brandId: (ctx.brand && ctx.brand.brandId) || (state.publish && state.publish.brandId) || '',
+    brandName: (ctx.brand && ctx.brand.brandName) || (state.publish && state.publish.brandName) || ''
+  };
+  const actor = ctx.actor || {};
+  const tAll = Date.now();   // 批量总耗时（真机日志：批量发布完成，总耗时 86.6s）
+
+  conclude(`本次归属：品牌「${who.brandName || '未标品牌'}」${actor.username ? ' · 执行人 ' + (actor.displayName || actor.username) : ''}`,
+    who.brandId ? 'info' : 'warn');
+  if (!who.brandId) conclude('这条批次没有品牌归属：发布日志里会记成「未标品牌」，统计时单独列出（不会并进任何品牌）', 'warn');
+
+  const todo = rows.filter(r => r.result !== '发布成功');
+  // 批次共有的设备配置在循环前检查，一次不匹配就保持所有条目待处理。
+  if (mode === 'adb' && todo.length && [false, true].some(video => uimap.tapPointsOf(uimap.stepsFor(map, video)).length)) {
+    // 「备用入口试发」的起点固定为首页：草稿箱只对常规发布是合法返回页。
+    const batchEntryJudge = focus => uimap.isHomeScreen(focus)
+      || (!ctx.forceAlternateEntry && uimap.isDraftScreen(focus));
+    const home = await adb.ensureApp(serial, {
+      pkg: uimap.DEWU.pkg, activity: uimap.DEWU.launchActivity, want: uimap.DEWU.homeActivity,
+      judge: batchEntryJudge, allowForceStop: false,
+      onNote: m => log(m, 'warn'),
+      timeoutMs: Number(c.ensureAppTimeoutMs) > 0 ? Number(c.ensureAppTimeoutMs) : 30000,
+      uploadWaitMs
+    });
+    if (!home.ok) {
+      // 与逐条入口一致：整批开始前也允许最后一条自动恢复（先确认没在上传，再重启得物）。
+      log(`发布前入口收不回来（${home.why || '未知原因'}），自动重启得物再试一次`, 'warn');
+      const hard = await adb.forceRecoverHome(serial, {
+        pkg: uimap.DEWU.pkg, activity: uimap.DEWU.launchActivity, want: uimap.DEWU.homeActivity,
+        judge: batchEntryJudge,
+        onNote: m => log(m, 'warn'),
+        timeoutMs: Number(c.ensureAppTimeoutMs) > 0 ? Number(c.ensureAppTimeoutMs) : 30000,
+        uploadWaitMs
+      });
+      if (!hard.ok) {
+        throw new Error('发布前未能将得物拉回首页：' + (home.why || '未知原因')
+          + '；自动重启得物也没恢复：' + (hard.why || '未知原因'));
+      }
+    }
+    ctx.uiMapScreen = map.screen;
+    try {
+      ctx.uiSize = await stableCoordinates(serial, map.screen, ctx);
+    } catch (error) {
+      if (error.code !== 'UI_COORDINATES') throw error;
+      // 仅在整批开始、尚未清相册或推素材时修复一次；发布途中不改屏幕布局。
+      try {
+        ctx.uiSize = await require('./displayrecovery').repair(serial, map.screen, {
+          cancelled: ctx.cancelled, log,
+          check: target => stableCoordinates(serial, target, ctx)
+        });
+      } catch (recoveryError) {
+        error.message += '；自动恢复未通过：' + recoveryError.message;
+        throw error;
+      }
+    }
+    const invalid = [false, true].flatMap(video => uimap.outOfScreenTapPoints(uimap.stepsFor(map, video), ctx.uiSize));
+    if (invalid.length) {
+      const error = new Error(`定位表坐标超出当前 ${ctx.uiSize.w}×${ctx.uiSize.h} 屏幕，请调整分辨率或重新导入定位表。尚未清理相册或推送素材。`);
+      error.code = 'UI_COORDINATES';
+      throw error;
+    }
+  }
+  // ★★ 2026-10-13 用户口径：「预估耗时都不准（图文 30 秒那套），直接删了吧」。
+  //   为什么删而不是调参数：单条耗时由设备、网络、素材体积、好物识别等待共同决定 ——
+  //   真机实测同一批图文 65–99s、视频 66–85s 全属正常范围 ⇒ 任何固定系数都会骗人。
+  //   与其给一个会被当成承诺的数字，不如只报「几条待发」，把真实耗时交给逐条实耗。
+  const itemById = new Map((state.items || []).map(it => [String(it.id), it]));
+  const kindCount = todo.reduce((a, r) => {
+    if (rowKind(r, itemById.get(String(r.id)) || {}) === 'video') a.video++; else a.image++;
+    return a;
+  }, { image: 0, video: 0 });
+  const mix = kindCount.video ? `（图文 ${kindCount.image} · 视频 ${kindCount.video}）` : '';
+  conclude(`开始发布（${mode === 'adb' ? '真实设备通道' : '模拟通道'}）：${todo.length} 条${mix}`, mode === 'adb' ? 'ok' : 'warn');
+  if (mode === 'mock') conclude('模拟通道不接触设备，只演练节奏/回写；要真发请先「连接模拟器」并点「检查能不能发布」通过', 'warn');
+  log('发布期间不占用发布单文件，结果先写 publish-log.jsonl', 'info');
+
+  const copyById = new Map((state.copyRows || []).map(r => [r.id, r]));
+  let done = 0;
+  const results = [];
+  const settledRows = new Set();
+  let stoppedReason = '';
+  let stoppedForScene = false;
+  let stoppedForSubmission = false;
+
+  for (const row of todo) {
+    if (cancelled()) break;
+    const item = state.items.find(it => it.id === row.id) || {};
+    row.images = (item.files || []).filter(f => f.type === 'image').length || 0;
+    row.goods = row.goods || 1;
+
+    // ★ 拦不拦看 `verify.isBlocked()`，**不是** `pass === false`：
+    //   前者只拦「有据可判的不一致」（颜色不匹配 / 多色漏填 / 主色不符）；
+    //   「货号查不到颜色」属于**没有数据**，按真机口径只告警、照常发布 ——
+    //   否则商品资料没导全时会**整批静默不发布**，而界面只显示「校验未通过」。
+    const blocked = (state.verify.rows || []).find(v => v.id === row.id);
+    if (blocked && verifySvc.isBlocked(blocked)) {
+      row.status = '未发布'; row.result = '校验未通过'; row.reason = blocked.note || blocked.conclusion;
+      onRow(row); results.push(row); done++;
+      progress({ done, total: todo.length, label: row.dir });
+      continue;
+    }
+
+    if (done > 0) {
+      // 真机是固定间隔（默认 60 秒），带倒计时；视频单条更慢，间隔单独放宽。
+      // ★ 2026-10-03 用户要求：加「连续发布」档（间隔 = 0）—— 上一条发完直接开始下一条。
+      //   取值走 gapSecFor（**不能**写 `|| 60`，否则 0 会被吃掉、选了「连续」还是等一分钟）。
+      const video = rowKind(row, item) === 'video';
+      const wait = gapSecFor(video ? 'video' : 'image', c);
+      if (wait > 0) {
+        // 有间隔时用户可能操作设备，不能沿用上一条返回页；连续发布直接复用。
+        ctx.publishReturnFocus = '';
+        log(`按 ${wait} 秒间隔，${wait}s 后执行`, 'info');
+        if (!await sleep(wait * 1000, cancelled, left => {
+          progress({ done, total: todo.length, label: `${left}s 后执行`, waitLeft: left });
+        })) break;
+      } else {
+        // 连续发布：不 sleep，直接进下一条。进度里明确写出来，免得看起来像"卡住没动"。
+        log('连续发布：不等间隔，直接开始下一条', 'info');
+        progress({ done, total: todo.length, label: `连续发布（已发 ${done} 条，直接发下一条）`, waitLeft: 0 });
+      }
+    }
+
+    // ★★ 2026-10-17 口径变更（用户：「一条没发成，后面的内容不能全受影响」）。
+    //   行级未确认（入口 / 转场 / 内容 / 相册占用）不再直接停批：
+    //     ① 先收回现场（首页或草稿箱）把**这一条**重走一遍（默认 2 次，见 rowAttemptsOf）；
+    //     ② 仍不行 ⇒ 这一条记失败、截图、收回现场，**继续下一条**；
+    //     ③ 只有「现场收不回来」（发布页正在上传 / 没有不丢内容的出口）才停批 ——
+    //        那种状态下清相册会打断正在上传的内容，硬来就是真事故。
+    //   仍然只跑一次就记失败的情况：非行级错误（例如设备掉线、定位表坐标不符）。
+    let success = false, reason = '', rowError = null, sceneBroken = '';
+    const t0 = Date.now();
+    row.startAt = new Date().toTimeString().slice(0, 8);
+    row.startedAtMs = t0;
+    row.elapsed = 0;
+    row.result = '';
+    row.reason = '';
+    row.status = '准备发布';
+    onRow(row);
+    // 运行批次表只显示真实开始执行的序号；筛选掉已完成行后 row.seq 仍是队列原始序号。
+    progress({ done, total: todo.length, label: row.dir, seq: row.seq });
+    const attempts = rowAttemptsOf(ctx, c);
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        if (mode === 'adb') {
+          success = await runReal(row, item, copyById.get(row.id), serial, map, ctx);
+        } else {
+          const r = await runMock(row, ctx);
+          success = r === 'cancelled' ? false : !!r;
+          if (r === 'cancelled') reason = '任务已取消';
+        }
+        rowError = null;
+        if (success) break;
+      } catch (e) {
+        success = false;
+        rowError = e;
+        require('./diagnostics').fail();
+        reason = cancelled() ? '任务已取消' : e.message;
+      }
+      if (cancelled()) break;
+      // 不是「这一条自己走不下去」的错误 ⇒ 不重试，交给下面的设备级判断。
+      // 相册清理类（ALBUM_*）也在这里：重走一遍会把上一次写进去的隔离标记当成放行依据。
+      if (!rowRetryable(rowError)) break;
+      // 最后一次不在这里收现场：先让外面把失败截图留下来（现场还在），再收。
+      if (attempt >= attempts || mode !== 'adb') break;
+      const rec = await recoverScene(serial, ctx, log, `行 ${row.seq} 第 ${attempt}/${attempts} 次未确认`);
+      if (!rec.ok) { sceneBroken = rec.why; break; }
+      log(`行 ${row.seq} 第 ${attempt}/${attempts} 次未确认（${reason}）；已收回首页/草稿箱，重走一遍入口再试`, 'warn');
+      row.status = '重试中';
+      row.reason = reason;
+      onRow(row);
+    }
+    if (rowError && rowError.code === 'UI_COORDINATES') stoppedReason = reason;
+    if (mode === 'adb' && !success && !cancelled() && !sceneBroken) await saveShot(serial, `seq${row.seq}_fail`, ctx);
+    if (!success && !cancelled() && rowRecoverable(rowError)) {
+      // 这一条已经判失败：把现场收到干净起点，好让下一条能从头走。
+      const rec = await recoverScene(serial, ctx, log, '本条失败后收回现场');
+      if (!rec.ok) sceneBroken = rec.why;
+      else conclude(`行 ${row.seq} 发布失败：${reason}；已自动收回现场，继续下一条`, 'warn');
+    }
+    if (sceneBroken) {
+      stoppedReason = (reason ? reason + '；' : '') + '自动收回现场失败：' + sceneBroken;
+      stoppedForScene = true;
+    }
+    if (success && ctx.submissionPending) {
+      // 提交点了、但当场没确认退出：先尝试收（上传中会被拒），收不回来才停批。
+      // ★ 例外：停在「上传/剪辑/加载」中间页时，页面可能还在跑上传 —— 这时连现场回收
+      //   （会强停重启）都不做，直接停批，否则就是把正在上传的内容打断。
+      if (ctx.submissionUnsafe) {
+        stoppedReason = ctx.submissionPending;
+        stoppedForSubmission = true;
+      } else {
+        const rec = await recoverScene(serial, ctx, log, '提交后未确认退出');
+        if (!rec.ok) {
+          stoppedReason = ctx.submissionPending + '；自动收回现场失败：' + rec.why;
+          stoppedForSubmission = true;
+        } else {
+          conclude(`${row.dir}：已点击提交，但当场没确认退出编辑流程；已自动收回现场，继续下一条`, 'warn');
+        }
+      }
+    }
+    require('./diagnostics').phase('条目结束');
+    // ★★ 模拟通道**不许冒充真发布**：走模拟时结果记「模拟成功」。
+    //   否则界面 / 台账 / 回写 Excel 全是绿的，而设备上什么都没发生（2026-10-03 实测踩到）。
+    //   「模拟成功」不会被统计成真发布（统计只认「发布成功」），也不会写「审核中」。
+    row.status = success ? (mode === 'adb' ? '发布成功' : '模拟成功') : '失败';
+    row.result = success ? (mode === 'adb' ? '发布成功' : '模拟成功') : '失败';
+    if (!success && cancelled()) { row.status = '已取消'; row.result = '已取消'; }
+    const rowCancelled = row.result === '已取消';
+    settledRows.add(row);
+    // ★ 2026-10-03：模拟通道不再随机失败 ⇒ 这里不需要「编一个失败原因」的分支了（拔掉假原因）。
+    row.reason = success ? '' : (reason || '未知');
+    if (!success) log(rowCancelled ? `${row.dir}：任务已取消，未继续发布` : `${row.dir} 发布失败，原因${row.reason}`, rowCancelled ? 'info' : 'warn');
+    const tag = rowKind(row, item) === 'video' ? '视频' : '图文';
+    row.elapsed = +((Date.now() - t0) / 1000).toFixed(1);
+    onRow(row);
+    if (success) log(`行 ${row.seq}[${tag}] 发布完成，已回填时间 ${row.startAt}（耗时 ${row.elapsed}s）`, 'ok');
+    else log(rowCancelled ? `行 ${row.seq}[${tag}] 已取消（耗时 ${row.elapsed}s）` : `行 ${row.seq}[${tag}] 发布失败，原因${row.reason}（耗时 ${row.elapsed}s）`, rowCancelled ? 'info' : 'warn');
+
+    sheet.appendLog({
+      batch, seq: row.seq, id: row.id, dir: row.dir, at: row.startAt, result: row.result, reason: row.reason,
+      title: String((copyById.get(row.id) || {}).title || ''),
+      body: topicinput.prepare(copyById.get(row.id) || {}).body,
+      // ★ 不再写 retries：失败不再重试 ⇒ 它恒为 0。旧台账里那一列照原样读（sheet 导出时仍认它）。
+      elapsed: row.elapsed, mode, kind: tag,
+      // 品牌 + 执行人：统计按品牌聚合、管理员追责，全靠这两个字段。
+      // 品牌名存快照，日后改名/删品牌时旧账里的名字不会跟着变
+      brandId: who.brandId, brandName: who.brandName,
+      userId: actor.userId || '', username: actor.username || '', displayName: actor.displayName || ''
+    });
+    results.push({
+      batch, seq: row.seq, at: row.startAt, result: row.result, reason: row.reason,
+      elapsed: row.elapsed, kind: tag,
+      brandId: who.brandId, brandName: who.brandName,
+      userId: actor.userId || '', username: actor.username || '',
+      audit: row.result === '发布成功' ? '审核中' : '',
+      reportRow: row.reportRow || 0   // 从「AI 内容报告」导入的行：回写时需要它在 Excel 里的行号
+    });
+    done++;
+    progress({ done, total: todo.length, label: row.dir, succeeded: results.filter(r => r.result === '发布成功').length });
+    if (stoppedReason) {
+      conclude((stoppedForScene ? '设备现场收不回来（不能在不丢内容的前提下离开发布页）'
+        : stoppedForSubmission ? '本条提交尚未稳定、无法确认能否继续'
+          : '设备屏幕配置变化') + '，本批次已停止；其余素材未执行：' + stoppedReason, 'warn');
+      break;
+    }
+  }
+
+  if (cancelled() || stoppedReason) {
+    for (const row of todo) {
+      if (settledRows.has(row) || row.result === '校验未通过') continue;
+      row.status = '未执行'; row.result = '未执行'; row.reason = '本批次已停止，尚未执行' + (stoppedReason ? '：' + stoppedReason : '');
+      row.startAt = ''; row.startedAtMs = null; row.elapsed = null;
+      onRow(row);
+    }
+  }
+  // 批次汇总只统计本次实际执行的结果；队列里此前已提交的条目不再计入。
+  const okCount = results.filter(r => r.result === '发布成功').length;
+  const failCount = results.filter(r => r.result === '失败').length;
+  log(`批量发布完成，总耗时 ${((Date.now() - tAll) / 1000).toFixed(1)}s`, 'info');
+  log(cancelled() || stoppedReason ? `批次已停止：成功 ${okCount} 条，失败 ${failCount} 条，其余已取消或未执行`
+    : `发布结束：共 ${todo.length} 条 / ${failCount} 失败，成功 ${okCount}（${mode === 'adb' ? '真实设备' : '模拟'}）。内容展示与审核结果请在得物查看`, cancelled() ? 'info' : stoppedReason ? 'warn' : 'ok');
+  return { rows, results, okCount, total: todo.length, failCount, batch, mode, stoppedReason, cancelled: !!cancelled() };
+}
+
+module.exports = {
+  sleep,
+  connect, run, saveShot, dumpForCapture,
+  // ★★ 2026-10-03：把**步骤引擎**也导出来。理由：真机上要逐屏验证某一步（选图 N 张、点颜色格）
+  //    时，只有拿这套真代码跑才算数 —— 自己另写一份「差不多的」点在真机上，验的就不是发布器了。
+  runStep,
+  openPublishEntry,
+  probes: adb.probe, probe: adb.probe, dump: adb.dump, dumpEx: adb.dumpEx,
+  currentFocus: adb.currentFocus,
+  imeComponent: adb.adbKeyboardIme,
+  devices, listDevices, scanDevices, addDevice, removeDevice,
+  // ★ 间隔取值（0 = 连续发布）。导出是为了让测试能直接断言「配 0 就是 0 秒」，
+  //   而不是靠"跑一遍看看会不会等"去猜 —— 那种断言在假 adb 上很容易假绿。
+  gapSecFor, secOr,
+  // ★★ 2026-10-04：把「提交发布后有没有真的离开发布流程」也导出来。
+  //   导出理由同 runStep：这一步是**新加的红线**（用户口径「发出去了才算成功」），
+  //   要能单独喂假 adb 验正反两面，而不是只能靠跑一整条发布去间接证明。
+  waitLeftPublishFlow
+};

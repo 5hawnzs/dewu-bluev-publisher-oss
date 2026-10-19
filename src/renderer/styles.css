@@ -1,0 +1,736 @@
+/* ================= 设计变量 ================= */
+:root{
+  --bg:#f2f1ed; --panel:#ffffff; --panel2:#f7f6f3; --side:#eceae4;
+  --bd:#dedcd5; --bd2:#c9c7bf;
+  --tx:#1a1a18; --tx2:#5f5e5a; --tx3:#8d8b83;
+  --teal:#0f6e56; --teal-bg:#e1f5ee;
+  --amber:#854f0b; --amber-bg:#faeeda;
+  --blue:#185fa5; --blue-bg:#e6f1fb;
+  --red:#a32d2d; --red-bg:#fcebeb;
+  --gray:#5f5e5a; --gray-bg:#eeece5;
+
+  /* Windows：优先 微软雅黑 UI / Segoe UI，避免用 PingFang 导致字形发虚 */
+  --font: "Microsoft YaHei UI","Microsoft YaHei","Segoe UI",-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Helvetica Neue",Arial,sans-serif;
+  --mono: "Cascadia Mono","Cascadia Code","Consolas","Microsoft YaHei UI","Courier New",monospace;
+  --caption-h:38px;
+}
+html.dark,html.glass{
+  --bg:#111113; --panel:#1b1b1e; --panel2:#212125; --side:#191919;
+  --bd:#2e2e33; --bd2:#404046;
+  --tx:#eaeae7; --tx2:#a3a19c; --tx3:#7a786f;
+  --teal:#5dcaa5; --teal-bg:#0b3b2e;
+  --amber:#ef9f27; --amber-bg:#3a2808;
+  --blue:#85b7eb; --blue-bg:#0b2743;
+  --red:#f09595; --red-bg:#3a1313;
+  --gray:#b4b2a9; --gray-bg:#26262a;
+}
+
+/* ================= ★ 第三档皮肤「玻璃」（2026-10-08 用户要求） =================
+   用户口径：玻璃**和 日间 / 夜间 是同一级别**的第三档，点顶栏那个按钮三档循环。
+   ★ 只动「颜色 + 模糊」——尺寸 / 间距 / 圆角 / 层级 / 交互一律不碰，结构零变化。
+   ★★ 磨砂**不是** CSS 做的，是**系统亚克力**（window.js 建窗时挂的 backgroundMaterial:'acrylic'）。
+      所以这里唯一要做的就是把页面底色**挖空**（透明），让亚克力透上来：
+        ① body 透明（原来的「极光底」已删 —— 那是自画的假磨砂，后面是纯色、不透桌面）
+        ② .app 不铺底色
+        ③ 面板给半透明深色底 ⇒ 就成了「烟熏玻璃」：亚克力（模糊后的桌面壁纸）从下面透出来
+   ★ 为什么语义色跟深色合写（上面那条 html.dark,html.glass）：玻璃是深色烟熏 ⇒
+     直接沿用深色的 --teal/--amber/--blue/--red，两处各写一份迟早对不上。
+   ★ 兜底：Win10 没有系统亚克力（该选项被忽略）⇒ 玻璃档退化成「清晰透出桌面」，仍然能透、只是不糊。
+   ★ 玻璃在**原生窗口层**按深色走（window.js 的 nativeForSkin）——否则会出现
+     「界面是玻璃、原生标题栏/滚动条却是浅色」的半浅半深。 */
+html.glass{
+  --bg:#0b0d12;
+  --panel:rgba(22,23,29,.62);
+  --panel2:rgba(31,32,40,.50);
+  --side:rgba(17,18,24,.58);
+  --bd:rgba(255,255,255,.10);
+  --bd2:rgba(255,255,255,.20);
+  --tx:#eef1f6; --tx2:#b7bec9; --tx3:#8b93a1;
+}
+/* 挖空页面底色 ⇒ 露出系统亚克力。★ 必须是 transparent：填任何颜色都会把亚克力盖死。 */
+html.glass body{background:transparent}
+html.glass .app{background:transparent}
+/* 面板的半透明深色底由上面的 --panel/--side 变量给出（烟熏感）。
+   这里的 backdrop-filter 只对**页面内**位于面板下层的元素生效，桌面在窗口外、糊不到它 ——
+   真正糊桌面的是系统亚克力。留着它是为了让弹层/浮窗叠在面板上时有轻微过渡。 */
+html.glass .titlebar,
+html.glass .side,
+html.glass .main,
+html.glass .logbar,
+html.glass .mbox,
+html.glass .toast{
+  backdrop-filter:blur(26px) saturate(165%);
+  -webkit-backdrop-filter:blur(26px) saturate(165%);
+}
+/* 下面这两处原来写死在 html.dark 选择器上，玻璃也是深色底 ⇒ 得跟着一份 */
+html.glass ::-webkit-scrollbar-thumb{background:rgba(150,150,150,.35);background-clip:content-box}
+html.glass ::-webkit-scrollbar-thumb:hover{background:rgba(180,180,180,.6);background-clip:content-box}
+html.glass .cap button:hover{background:rgba(255,255,255,.10)}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--tx);
+  font:13px/1.6 var(--font);
+  overflow:hidden;
+  -webkit-text-size-adjust:100%;
+  user-select:none;               /* 桌面软件观感：chrome 不可选，正文可选 */
+  cursor:default;
+}
+.pane,td,th,.tree,.lines,.inp,hint{user-select:text}
+
+/* ============ Windows 风格滚动条 ============ */
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(140,138,130,.45);border:3px solid transparent;background-clip:content-box;border-radius:99px}
+::-webkit-scrollbar-thumb:hover{background:rgba(110,108,100,.75);background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent}
+html.dark ::-webkit-scrollbar-thumb{background:rgba(150,150,150,.35);background-clip:content-box}
+html.dark ::-webkit-scrollbar-thumb:hover{background:rgba(180,180,180,.6);background-clip:content-box}
+
+/* ---------- app window ---------- */
+.app{
+  width:100%;height:100%;
+  background:var(--panel);
+  display:flex;flex-direction:column;overflow:hidden;
+}
+
+/* ---------- 自绘标题栏（Windows 布局：控件在右上） ---------- */
+.titlebar{
+  height:var(--caption-h);flex:0 0 var(--caption-h);
+  display:flex;align-items:stretch;
+  border-bottom:1px solid var(--bd);background:var(--panel2);
+  -webkit-app-region:drag;
+}
+.titlebar .tb-left{display:flex;align-items:center;gap:9px;padding:0 12px;min-width:0}
+.titlebar .logo{width:17px;height:17px;display:block;border-radius:4px;flex:0 0 17px}
+.titlebar .logo svg{display:block;width:17px;height:17px;border-radius:4px}
+.titlebar .name{font-size:12.5px;font-weight:600;letter-spacing:.2px;white-space:nowrap}
+/* 版本号小标签（app 名字后面）：低调的次要文字，用主题变量 ⇒ 浅/深色都不用另写一份 */
+.titlebar .chip-ver{font-size:11px;padding:2px 8px;font-weight:600;letter-spacing:.02em;background:transparent;color:var(--tx3)}
+.titlebar .tb-drag{flex:1}
+.titlebar .tb-right{display:flex;align-items:stretch;-webkit-app-region:no-drag}
+.titlebar .chips{display:flex;align-items:center;gap:8px;padding-right:6px}
+.chip{font-size:11.5px;padding:3px 10px;border-radius:99px;background:var(--panel);border:1px solid var(--bd);color:var(--tx2);white-space:nowrap}
+.chip.run{background:var(--teal-bg);color:var(--teal);border-color:transparent;font-weight:600}
+.chip.warn{background:var(--amber-bg);color:var(--amber);border-color:transparent;font-weight:600}
+
+.cap{display:flex;align-items:stretch}
+.cap button{
+  width:45px;border:0;background:transparent;color:var(--tx2);
+  display:flex;align-items:center;justify-content:center;cursor:pointer;
+  -webkit-app-region:no-drag;
+}
+.cap button svg{width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:1}
+.cap button.max svg{width:11px;height:11px;stroke-width:1.3}
+.cap button:hover{background:rgba(128,128,110,.16)}
+.cap button.close:hover{background:#e81123;color:#fff}
+html.dark .cap button:hover{background:rgba(255,255,255,.10)}
+
+.body{flex:1;display:flex;min-height:0}
+
+/* ---------- sidebar ---------- */
+.side{
+  width:156px;flex:0 0 156px;background:var(--side);border-right:1px solid var(--bd);
+  padding:10px 8px;display:flex;flex-direction:column;gap:2px;overflow-y:auto;
+}
+.side .grp{font-size:10.5px;color:var(--tx3);letter-spacing:.08em;padding:12px 10px 5px}
+.nav{
+  display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:6px;
+  font-size:13px;color:var(--tx2);cursor:pointer;user-select:none;
+  width:100%;text-align:left;border:0;background:transparent;font-family:var(--font);
+}
+/* ★ 必须显式写这条：UA 自带的 [hidden]{display:none} 会被上面 .nav 的 display:flex 盖掉
+   （作者样式表优先于 UA 样式表），于是「非管理员藏起高级设置页签」就只是把属性设上了、
+   按钮还杵在那儿 —— 点一下被弹回来，看着像坏了。2026-10-02 被自检抓出来。 */
+.nav[hidden]{display:none}
+.nav:hover{background:rgba(128,128,110,.12)}
+.nav .ic{width:16px;height:16px;flex:0 0 16px;display:block;opacity:.75}
+.nav .ic svg{display:block;width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.nav.on{background:var(--panel);color:var(--tx);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.nav.on .ic{opacity:1}
+.folder-tool-link{
+  position:relative;isolation:isolate;display:flex;align-items:center;gap:9px;padding:8px 12px;border-radius:999px;
+  margin-top:auto;font-size:13px;color:var(--tx2);cursor:pointer;user-select:none;
+  width:100%;text-align:left;border:0;background:transparent;font-family:var(--font);
+  box-shadow:inset 0 -8px 10px #8fdfff1f;transition:box-shadow .3s ease;
+}
+.folder-tool-link::before{
+  content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;pointer-events:none;
+  background:linear-gradient(90deg,#ffaa4080,#9c40ff80,#ffaa4080);background-size:300% 100%;
+  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;animation:folder-tool-gradient 8s linear infinite;
+}
+/* 外圈亮光沿胶囊边框循环移动，遮罩保证按钮中间保持透明。 */
+@property --folder-tool-angle{syntax:"<angle>";initial-value:0deg;inherits:false}
+.folder-tool-link::after{
+  content:"";position:absolute;inset:0;border-radius:inherit;padding:0.9px;pointer-events:none;
+  background:conic-gradient(from var(--folder-tool-angle),transparent 0deg,transparent 328deg,#9c40ff 338deg,#ffaa40 347deg,#fff4d8 352deg,transparent 356deg,transparent 360deg);
+  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;animation:folder-tool-border-flow 4s linear infinite;
+}
+.folder-tool-link:hover{box-shadow:inset 0 -5px 10px #8fdfff3f}
+.folder-tool-link:focus-visible{outline:2px solid #9c40ff;outline-offset:3px}
+.folder-tool-text{
+  flex:1;font-weight:500;color:#7c3aed;background:linear-gradient(90deg,#b97100,#7c3aed,#b97100);
+  background-size:300% 100%;background-clip:text;-webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;animation:folder-tool-gradient 8s linear infinite;
+}
+html.dark .folder-tool-text{background-image:linear-gradient(90deg,#ffaa40,#b877ff,#ffaa40)}
+@keyframes folder-tool-gradient{0%{background-position:0% 50%}100%{background-position:150% 50%}}
+@keyframes folder-tool-border-flow{to{--folder-tool-angle:360deg}}
+@media(prefers-reduced-motion:reduce){.folder-tool-link::before,.folder-tool-link::after,.folder-tool-text{animation-duration:18s}.folder-tool-link{transition:none}}
+.folder-tool-link .ic{width:16px;height:16px;flex:0 0 16px;display:block;opacity:.75}
+.folder-tool-link .ic svg{display:block;width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+
+/* ---------- main ---------- */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.head{
+  padding:14px 22px 12px;border-bottom:1px solid var(--bd);
+  display:flex;align-items:flex-start;gap:14px;flex:0 0 auto;
+}
+.head h2{font-size:16px;font-weight:600;margin:0 0 3px}
+.head p{margin:0;font-size:12px;color:var(--tx3)}
+.head .act{margin-left:auto;display:flex;gap:8px;flex-shrink:0;align-items:center}
+button.btn{
+  font-family:var(--font);font-size:12.5px;font-weight:600;padding:7px 15px;border-radius:6px;
+  border:1px solid var(--bd2);background:var(--panel);color:var(--tx);cursor:pointer;
+}
+button.btn:hover{border-color:var(--tx3)}
+button.btn.primary{background:var(--teal);border-color:var(--teal);color:#fff}
+button.btn.primary:hover{opacity:.9}
+button.btn:disabled{opacity:.45;cursor:default}
+button.btn.sm{padding:4px 10px;font-size:11.5px}
+
+.pane{flex:1;overflow-y:auto;padding:16px 22px 24px}
+
+/* ---------- bits ---------- */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:10px;margin-bottom:16px}
+.stat{background:var(--panel2);border:1px solid var(--bd);border-radius:8px;padding:9px 12px}
+.stat b{display:block;font-size:19px;font-weight:600;line-height:1.25}
+.stat span{font-size:11px;color:var(--tx3)}
+.stat.bad b{color:var(--red)} .stat.good b{color:var(--teal)}
+
+.tw{border-radius:8px;overflow-x:auto}
+/* ★ 2026-10-17：去掉 max-width:960px —— 窗口一宽，表格就被按 960 居中，
+   两侧各留一大块白（用户截图里的两块红框）。现在跟上面那张批次表一样占满整行。 */
+.publish-rows table{table-layout:fixed;width:100%;min-width:860px;margin:0}
+.publish-rows th,.publish-rows td,.publish-rows td.num{text-align:center;vertical-align:middle}
+.publish-rows td{height:42px;box-sizing:border-box}
+.publish-rows td:nth-child(2){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.publish-rows [data-publish-status] .b{display:inline-block;max-width:100%;box-sizing:border-box;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;white-space:nowrap}
+/* 失败原因与状态同一行、不换行：行高永远不变。完整原因在 title 里悬停可看。 */
+.publish-rows [data-publish-status]{white-space:nowrap}
+.row-reason{display:inline-block;max-width:calc(100% - 58px);margin-left:6px;vertical-align:middle;font-size:11px;opacity:.8;line-height:1.45;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.publish-pagination{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:5px;padding:12px 0 2px}
+.publish-page{min-width:30px;height:30px;padding:0 8px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--tx2);font:inherit;font-size:11.5px;font-variant-numeric:tabular-nums;cursor:pointer;transition:color .16s,background .16s,border-color .16s}
+.publish-page:hover{background:var(--panel2);color:var(--tx)}
+.publish-page.on{background:var(--panel);border-color:var(--bd);color:var(--tx);box-shadow:0 1px 3px #00000012}
+.publish-page:focus-visible{outline:2px solid var(--teal);outline-offset:1px}
+.publish-page-summary{margin-left:5px;color:var(--tx3);font-size:11px;font-variant-numeric:tabular-nums}
+.publish-current{margin:9px 0 0;color:var(--teal);font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}
+.export-files{margin-bottom:10px}
+.export-files>summary{display:inline-flex;align-items:center;gap:8px;padding:3px 0;color:var(--tx2);font:600 12.5px/1.6 var(--font);letter-spacing:.03em;list-style:none;cursor:pointer}
+.export-files>summary::-webkit-details-marker{display:none}
+.export-files>summary::before{content:"";width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(-45deg);transition:transform .16s ease}
+.export-files[open]>summary::before{transform:rotate(45deg)}
+.export-files>summary:hover{color:var(--tx)}
+.export-files>summary:focus-visible{outline:2px solid var(--teal);outline-offset:3px;border-radius:4px}
+.export-files-actions{margin-top:8px}
+table{border-collapse:collapse;width:100%;font-size:12.5px;background:var(--panel2)}
+th,td{border-bottom:1px solid var(--bd);padding:7px 10px;text-align:left;vertical-align:middle}
+th{background:var(--panel);font-size:11.5px;font-weight:600;color:var(--tx2);position:sticky;top:0;white-space:nowrap;z-index:1}
+tr:last-child td{border-bottom:none}
+tr.flag{background:var(--red-bg)}
+tr.flag td{color:var(--red)}
+tr.warnrow{background:var(--amber-bg)}
+tr.warnrow td{color:var(--amber)}
+td.mono,th.mono{font-family:var(--mono);font-size:12px}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+td.cut{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sw{display:inline-block;width:11px;height:11px;border-radius:3px;border:1px solid rgba(0,0,0,.15);vertical-align:-1px;margin-right:5px}
+
+.b{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;white-space:nowrap}
+.b-ok{background:var(--teal-bg);color:var(--teal)}
+.b-bad{background:var(--red-bg);color:var(--red)}
+.b-wait{background:var(--gray-bg);color:var(--gray)}
+.b-warn{background:var(--amber-bg);color:var(--amber)}
+.b-run{background:var(--blue-bg);color:var(--blue)}
+
+.box{background:var(--panel2);border:1px solid var(--bd);border-radius:8px;padding:13px 15px;margin-bottom:13px}
+.box h3{font-size:12.5px;font-weight:600;margin:0 0 9px;color:var(--tx2);letter-spacing:.03em}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.row .lbl{font-size:12px;color:var(--tx3);min-width:84px}
+.inp{
+  flex:1;min-width:170px;font-family:var(--font);font-size:12.5px;padding:7px 10px;border-radius:6px;
+  border:1px solid var(--bd2);background:var(--panel);color:var(--tx);
+}
+.inp:focus{outline:2px solid var(--teal);outline-offset:-1px}
+.inp.mono{font-family:var(--mono);font-size:12px}
+select.inp{flex:0 0 auto;min-width:110px;padding:7px 8px}
+.bar{height:6px;background:var(--bd);border-radius:99px;overflow:hidden;width:100%;min-width:120px}
+.bar i{display:block;height:100%;background:var(--teal);width:0;transition:width .3s ease}
+.bar i.blue{background:var(--blue)}
+.tree{font-family:var(--mono);font-size:12px;line-height:1.85;color:var(--tx2);background:var(--panel);border:1px solid var(--bd);border-radius:8px;padding:12px 14px;max-height:230px;overflow:auto}
+.tree b{color:var(--teal);font-weight:600}
+.tree s{color:var(--tx3);text-decoration:none}
+.hint{font-size:11.5px;color:var(--tx3);margin:8px 0 0;line-height:1.7}
+.hint b{color:var(--tx2)}
+code{font-family:var(--mono);font-size:11.5px;background:var(--panel);border:1px solid var(--bd);border-radius:4px;padding:1px 5px;color:var(--tx2)}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+.empty{color:var(--tx3);font-size:12.5px;padding:24px 4px;text-align:center;border:1px dashed var(--bd2);border-radius:8px}
+.progwrap{display:flex;align-items:center;gap:10px;margin:10px 0 0}
+
+/* ---------- log ---------- */
+.logbar{
+  flex:0 0 auto;border-top:1px solid var(--bd);background:var(--panel2);
+  max-height:112px;display:flex;flex-direction:column;
+}
+.logbar .lt{font-size:10.5px;color:var(--tx3);letter-spacing:.08em;padding:6px 16px 2px;display:flex;align-items:center;gap:8px}
+.logbar .lt .grow{flex:1}
+.logbar .lt button{border:0;background:transparent;color:var(--tx3);cursor:pointer;font-size:11px;font-family:var(--font)}
+.logbar .lt button:hover{color:var(--tx)}
+.logbar .lines{overflow-y:auto;padding:0 16px 8px;font-family:var(--mono);font-size:11.5px;line-height:1.7;color:var(--tx2)}
+.logbar .lines div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.logbar .t{color:var(--tx3);margin-right:8px}
+.logbar .ok{color:var(--teal)} .logbar .er{color:var(--red)} .logbar .wn{color:var(--amber)}
+.logbar .inf{color:var(--tx2)}
+
+/* ---------- 提示气泡 ---------- */
+.toast{
+  position:fixed;right:16px;bottom:16px;z-index:50;
+  background:var(--panel);border:1px solid var(--bd2);border-radius:8px;
+  box-shadow:0 8px 28px rgba(0,0,0,.18);padding:10px 14px;font-size:12.5px;max-width:400px;
+}
+.toast.err{border-color:var(--red);color:var(--red)}
+.toast.ok{border-color:var(--teal);color:var(--teal)}
+
+/* ---------- 标题栏：当前账号 + 退出 ---------- */
+.chip-user{background:var(--teal-bg);color:var(--teal);border-color:transparent;font-weight:600;max-width:180px;overflow:hidden;text-overflow:ellipsis}
+.tbbtn{
+  font-family:var(--font);font-size:11px;color:var(--tx3);
+  background:transparent;border:1px solid var(--bd);border-radius:99px;
+  padding:3px 9px;cursor:pointer;
+}
+.tbbtn:hover{color:var(--tx);border-color:var(--bd2)}
+.tbbtn.ico{width:24px;height:24px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.tbbtn.ico svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round}
+/* 主题 Dock（顶栏「项目」左边）：日间 / 夜间 / 玻璃 三个图标常驻。
+   ★ 2026-10-08：原来是「一个圆键循环三档」，用户要求改成 Spring dock 那种
+     「指针靠近 → 按距离弹簧放大」。三档语义不变，控件形态换了。
+   ★ 放大**不是 CSS transition** —— 是 app.js 里一个按需启停的 rAF 弹簧
+     （React 里 useMotionValue/useSpring 的原生等价物）。这里只消费它每帧写下的
+     两个自定义属性：--s(缩放) / --lift(上浮)，transform 由它们算。
+   ★ 撤掉的老写法：原来三个 SVG 都留 DOM、靠 html.dark/html.glass 决定显哪一个。
+     现在三个图标**同时可见**，所以那 5 条 `#themeBtn .i-*` 显隐规则已整段删除 ——
+     留着就是「三档皮肤下仍只显一个」的死规则。
+   ★ 栏高只有 --caption-h(38px)：放大上限必须压在栏内（origin 居中、不上浮），
+     否则 icon 会顶到窗口上沿、被 .app 的 overflow:hidden 裁掉。 */
+.theme-dock{display:flex;align-items:center;gap:2px;flex:0 0 auto}
+.theme-dock .tdock{
+  width:24px;height:24px;padding:0;border:0;border-radius:50%;
+  background:transparent;color:var(--tx3);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  transform:scale(var(--s,1)) translateY(calc(var(--lift,0px) * -1));
+  will-change:transform;
+}
+.theme-dock .tdock svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.theme-dock .tdock:hover{color:var(--tx)}
+/* 当前那一档点亮（这是 Dock 的选中态，不是新增的状态芯片） */
+.theme-dock .tdock.on{color:var(--teal);background:var(--teal-bg)}
+
+/* ---------- 登录门（未登录时盖住整个窗口） ---------- */
+body.locked .app{display:none}
+/* 显式互斥两棵界面树，避免慢设备切换尺寸时重绘出旧的主界面。 */
+.app[hidden],.gate[hidden]{display:none!important}
+.inp:disabled{opacity:.45;cursor:not-allowed}
+body:not(.locked) .gate{display:none}
+/* ★ 登录页**固定浅色**：它是封面，不跟系统深色走。
+   用户 Windows 是深色模式（AppsUseLightTheme=0），而出厂「跟随系统」会让整块登录窗变成
+   近黑底（--bg #111113），卡片周围就成了一卷黑 —— 观感像给卡片套了个黑框（2026-10-02 用户反馈）。
+   做法：把浅色那套变量在 .gate 子树里重新声明一遍（自定义属性会向下继承），
+   页面里所有 var(--x) 自动变回浅色；**主界面仍然跟随系统主题**（设置 → 外观）。 */
+.gate{
+  --bg:#f2f1ed; --panel:#ffffff; --panel2:#f7f6f3; --side:#eceae4;
+  --bd:#dedcd5; --bd2:#c9c7bf;
+  --tx:#1a1a18; --tx2:#5f5e5a; --tx3:#8d8b83;
+  --teal:#0f6e56; --teal-bg:#e1f5ee; --amber:#854f0b; --amber-bg:#faeeda;
+  --red:#a32d2d; --red-bg:#fcebeb; --gray:#5f5e5a; --gray-bg:#eeece5;
+  /* ★★ 关键：这里必须**显式给 color** —— 光重声明变量是不够的！
+     body 上的 color:var(--tx) 已经按 html.dark 求过一次值（#eaeae7 浅字），
+     后代继承到的是那个**算完的具体颜色**，不是 var() 表达式 ⇒ 卡片里任何
+     没显式设色的文字（例如 .gname「得物蓝V素材发布工具」）在白底上就是白字。
+     2026-10-02 用户反馈「白底白字」定位到这条。 */
+  color:var(--tx);
+  position:fixed;inset:0;z-index:100;
+  display:flex;align-items:center;justify-content:center;
+  background:#ffffff;   /* 与卡片同色：窗口＝卡片，卡片外面不留任何别的底色 */
+  /* 无边框小窗：整块遮罩就是拖拽区，卡片以外的空白也能拖着走 */
+  -webkit-app-region:drag;
+}
+/* 交互控件必须显式 no-drag，否则拖拽区会把点击吃掉（输入框点不进去） */
+.gate input,.gate button,.gate label,.gate a,.gate select,
+.gate .gerr{-webkit-app-region:no-drag}
+.gate .gcard{
+  position:relative;
+  width:340px;background:var(--panel);
+  border-radius:12px;
+  padding:24px 26px 20px;
+  box-shadow:0 18px 50px rgba(0,0,0,.16);
+}
+/* 关闭口：缩在卡片右上角内部，不再往卡片外挂标题带 */
+.gate .gcard .gx{
+  position:absolute;top:16px;right:16px;
+  width:24px;height:24px;border-radius:6px;padding:0;
+  display:flex;align-items:center;justify-content:center;
+  background:transparent;border:0;color:var(--tx3);cursor:pointer;
+}
+.gate .gcard .gx svg{width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:1;display:block}
+.gate .gcard .gx:hover{background:#e81123;color:#fff}
+.gate .gbrand{display:flex;align-items:center;gap:11px;margin-bottom:18px;padding-right:30px}
+.gate .glogo{display:flex}
+.gate .gname{font-size:14px;font-weight:600;letter-spacing:.02em}
+.gate .gsub{font-size:11.5px;color:var(--tx3);margin-top:2px}
+.gate .gfld{display:block;margin-bottom:10px}
+.gate .gfld span{display:block;font-size:11.5px;color:var(--tx3);margin-bottom:4px}
+.gate .gfld .inp{width:100%;min-width:0}
+.gate .password-group{display:flex;align-items:stretch;width:100%;position:relative;margin:0;color:inherit}
+.gate .password-group .inp{width:100%;min-width:0;padding-right:42px}
+.gate .password-toggle{z-index:2;
+  position:absolute;right:4px;top:50%;transform:translateY(-50%);
+  width:30px;height:30px;padding:0;border:0;border-radius:5px;background:transparent;color:var(--tx3);
+  display:flex;align-items:center;justify-content:center;cursor:pointer
+}
+.gate .password-toggle:hover{background:var(--panel2);color:var(--tx2)}
+.gate .password-toggle:focus-visible{outline:2px solid var(--teal);outline-offset:1px}
+.gate .password-eye{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.gate .grem{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--tx3);margin:2px 0 12px;cursor:pointer}
+.gate .gerr{min-height:0;font-size:11.5px;color:var(--red);margin-bottom:6px}
+.gate .ggo{width:100%;min-height:40px;padding:6px 10px;font-size:13px;letter-spacing:.08em;display:flex;align-items:center;justify-content:center}
+.gate .gcard[hidden]{display:none!important}
+.gate .gloading{text-align:center;padding-top:34px;padding-bottom:28px}
+.gate .gloading .gate-wave{margin:28px 0 12px}
+.gate .gate-wave{height:40px;display:flex;align-items:center;justify-content:center;gap:6px;letter-spacing:normal}
+.gate .gate-wave-bar{width:6px;height:8px;border-radius:999px;background:#27272a;animation:gate-wave 1.2s ease-in-out infinite;animation-delay:calc(var(--wave-level)*.1s)}
+@keyframes gate-wave{0%,100%{height:8px}50%{height:24px}}
+@media (prefers-reduced-motion:reduce){.gate .gate-wave-bar{animation:none;height:8px}}
+
+/* ---------- 设置：账号管理表 ---------- */
+.acct-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}
+.acct-toolbar .inp{flex:0 0 auto;min-width:120px}
+
+/* ---------- 标题栏：当前品牌 ---------- */
+/* 用原生 select，但抹平系统外观做成 chip 的样子（右边那个小箭头是用渐变压出来的） */
+.chip-sel{
+  font:inherit;font-size:11.5px;padding:3px 24px 3px 10px;border-radius:99px;max-width:200px;
+  background:var(--panel);border:1px solid var(--bd);color:var(--tx2);
+  white-space:nowrap;text-overflow:ellipsis;cursor:pointer;appearance:none;-webkit-appearance:none;
+  background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%);
+  background-position:calc(100% - 13px) 54%,calc(100% - 9px) 54%;
+  background-size:4px 4px,4px 4px;background-repeat:no-repeat;
+}
+.chip-sel:hover{border-color:var(--tx3)}
+.chip-sel:focus{outline:2px solid var(--teal);outline-offset:1px}
+/* 没有可用品牌 / 还没选：用告警色，别让它看着像正常状态 */
+.chip-sel.warn{background-color:var(--amber-bg);color:var(--amber);border-color:transparent;font-weight:600}
+
+/* ---------- 品牌统计 ---------- */
+/* 频次柱：一眼看出「哪个品牌最近没在发」。没有数据的那天画成细灰线，避免看起来像漏了 */
+.spark{display:flex;align-items:flex-end;gap:2px;height:22px;min-width:40px}
+.spark i{display:block;width:5px;background:var(--teal);border-radius:1px;min-height:2px;opacity:.85}
+.spark i.zero{background:var(--bd);opacity:1}
+.brandrow-flag td{background:var(--amber-bg)}
+.brandrow-dead td{background:var(--gray-bg)}
+.tagline{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}
+
+/* ---------- 品牌权限 ---------- */
+.brandcell{max-width:260px}
+.brandcell .chip{margin:1px 3px 1px 0;display:inline-block}
+.perm-list{display:flex;align-items:center;gap:10px;flex-wrap:wrap;flex:1 1 100%}
+.perm-list .perm{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--tx2);cursor:pointer;
+  padding:3px 9px;border:1px solid var(--bd);border-radius:6px;background:var(--panel2);white-space:nowrap}
+.perm-list .perm:hover{border-color:var(--tx3)}
+
+/* ---------- 弹窗：品牌 / 文案提示词 ---------- */
+/* 挂在 .app 外面，要盖过标题栏和日志条；层级放在登录门（100）之下 */
+.modal{
+  position:fixed;inset:0;z-index:90;padding:26px;
+  display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.42);-webkit-app-region:no-drag;
+}
+.modal[hidden]{display:none}
+.mbox{
+  width:min(780px,100%);max-height:100%;
+  display:flex;flex-direction:column;overflow:hidden;
+  background:var(--panel);border:1px solid var(--bd2);border-radius:10px;
+  box-shadow:0 20px 52px rgba(0,0,0,.3);
+}
+/* 账号操作弹窗（配置权限 / 重置密码）：内容少，窄一档更像「对着某个人办事」 */
+.mbox-sm{width:min(520px,100%)}
+.mh{display:flex;align-items:center;gap:9px;padding:12px 16px;border-bottom:1px solid var(--bd);background:var(--panel2)}
+.mh h3{margin:0;font-size:13.5px;font-weight:600}
+.mh .grow{flex:1}
+.mb{padding:14px 16px;overflow:auto;user-select:text}
+.mf{display:flex;align-items:center;gap:8px;padding:11px 16px;border-top:1px solid var(--bd);background:var(--panel2)}
+.mf .grow{flex:1}
+
+/* 品牌列表：一行一个品牌，点进去编辑 */
+.blist{display:flex;flex-direction:column;gap:7px}
+.brow{
+  display:flex;align-items:center;gap:10px;padding:10px 12px;cursor:pointer;
+  border:1px solid var(--bd);border-radius:8px;background:var(--panel2);
+}
+.brow:hover{border-color:var(--teal);background:var(--teal-bg)}
+.brow .bn{font-weight:600;min-width:110px}
+.brow .grow{flex:1;min-width:0}
+.brow .snip{color:var(--tx3);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brow.dead{opacity:.55}
+
+/* 弹窗里的表单 */
+.mfld{display:block;margin-bottom:12px}
+.mfld>span{display:block;font-size:11.5px;color:var(--tx3);margin-bottom:5px}
+.mta{
+  width:100%;min-height:100px;resize:vertical;
+  font:12px/1.65 var(--mono);
+  background:var(--panel2);color:var(--tx);
+  border:1px solid var(--bd);border-radius:7px;padding:9px 10px;
+}
+.mta:focus{outline:none;border-color:var(--teal)}
+.mta[readonly]{opacity:.62}
+/* 品牌弹窗里的「文案生成提示词」：比默认高，能一眼看到十几行，少滚动 */
+.mta.tall{min-height:260px}
+.mchk{display:flex;align-items:center;gap:7px;margin:0 0 9px;font-size:12.5px;color:var(--tx2);cursor:pointer}
+.mchk input{cursor:pointer}
+.mchk[data-off="1"]{cursor:not-allowed;opacity:.55}
+.mnote{font-size:11.5px;color:var(--tx3);margin:6px 0 0}
+.mnote.warn{color:var(--amber)}
+
+/* ---------- 热词库页（页签 12） ---------- */
+.lxwords{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px}
+.lxw{position:relative;display:inline-flex;align-items:center;justify-content:center;text-align:center;min-height:28px;line-height:1.2;padding:4px 24px}
+.lxw .lxx{position:absolute;right:6px;top:50%;transform:translateY(-50%);display:flex;align-items:center;justify-content:center;width:14px;height:16px;border:0;background:transparent;color:var(--tx3);cursor:pointer;font-size:14px;line-height:1;padding:0;border-radius:50%}
+.lxw .lxx:hover{color:var(--red)}
+/* Chrome 工具栏风格的小图标按钮，悬停显示撤销/重做名称。 */
+button.btn.lx-history{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;min-width:28px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--tx2)}
+button.btn.lx-history svg{width:16px;height:16px}
+button.btn.lx-history:hover:not(:disabled){background:var(--gray-bg);color:var(--tx)}
+button.btn.lx-history:disabled{opacity:.3;cursor:default}
+.lxlock{opacity:.72}
+.lxlock .lxw{padding:4px 10px}
+#lxStatus{margin-bottom:16px}
+#lxStatusRow .chip{display:inline-flex;align-items:center;justify-content:center;min-height:28px;line-height:1.4}
+.head .act:has(.lx-transfer){flex-wrap:wrap;justify-content:flex-end}
+button.btn.lx-transfer{display:inline-flex;align-items:center;justify-content:center;gap:10px;height:36px;padding:0 18px;border-radius:40px;background:var(--panel2);font-size:13px;font-weight:500;transition:background .15s,transform .15s}
+button.btn.lx-transfer:hover:not(:disabled){background:var(--panel);transform:scale(1.02)}
+button.btn.lx-transfer:active:not(:disabled){transform:scale(.96)}
+.lx-transfer-icon{position:relative;display:block;flex:none;width:16px;height:16px;overflow:hidden}
+.lx-transfer-icon>span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;transition:transform .2s,opacity .2s}
+.lx-transfer-icon svg{width:16px;height:16px}
+.lx-transfer-clone{transform:translateY(-20px);opacity:0}
+.lx-transfer-check{transform:scale(.5);opacity:0}
+.lx-export:hover:not(:disabled) .lx-transfer-main{animation:lx-download-main .8s ease-in-out infinite}
+.lx-export:hover:not(:disabled) .lx-transfer-clone{animation:lx-download-clone .8s ease-in-out infinite}
+.lx-import:hover:not(:disabled) .lx-transfer-main,.lx-transfer[data-done="1"] .lx-transfer-main{transform:scale(.5);opacity:0}
+.lx-import:hover:not(:disabled) .lx-transfer-check,.lx-transfer[data-done="1"] .lx-transfer-check{transform:scale(1);opacity:1}
+.lx-transfer[data-done="1"] .lx-transfer-main,.lx-transfer[data-done="1"] .lx-transfer-clone{animation:none!important;opacity:0}
+@keyframes lx-download-main{0%,15%{transform:translateY(0);opacity:1}65%,100%{transform:translateY(20px);opacity:0}}
+@keyframes lx-download-clone{0%,15%{transform:translateY(-20px);opacity:0}65%,100%{transform:translateY(0);opacity:1}}
+@media(prefers-reduced-motion:reduce){.lx-transfer-icon>span,button.btn.lx-transfer{transition:none}.lx-export:hover:not(:disabled) .lx-transfer-main,.lx-export:hover:not(:disabled) .lx-transfer-clone{animation:none}button.btn.lx-transfer:hover:not(:disabled),button.btn.lx-transfer:active:not(:disabled){transform:none}}
+
+/* ---------- 窄屏适配：**没有**「侧栏横排」这一档（有意删掉的，别加回来） ----------
+   ★ 2026-10-03 用户要求：「目录始终固定在左侧，不能因窗口变小就放到上面」。
+     这里原来有一条
+       @media (max-width:900px){ .body{flex-direction:column} .side{width:100%;flex-direction:row} … }
+     把侧栏翻到顶上横排；而主窗口的 minWidth 恰好**也是 900** ⇒ 窗口一缩到最小就正好命中
+     （实测：窗口 940 侧栏还竖着，930 起翻上去）。用户每次拖到底都会看到侧栏跳上去。
+   ⇒ 整块删掉。主窗口最小尺寸见 src/main/window.js 的 MAIN_MIN（960×640），比这条断点宽，
+     所以这套窄屏适配本来就是死代码。
+   ★ 若以后要调小 MAIN_MIN.w，必须重新想这两件事：
+     ① 侧栏要不要横排（用户明确说过不要）；
+     ② .two（「素材整理」页的「整理前 / 整理后」两列）在窄屏要不要变单列。
+     另：品牌统计页那张表需要 660px 宽，窗口窄于 934 它就会横向滚动。 */
+.stats-page th,.stats-page td,.stats-users th,.stats-users td{text-align:center!important;vertical-align:middle}
+.stats-page .stat,.stats-page h3,.stats-page .hint,.stats-page .empty{text-align:center}
+.stats-page .spark,.stats-page .tagline{justify-content:center}
+.stats-tabs{position:relative;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;padding:4px;margin:0 0 14px;border:1px solid var(--bd);border-radius:12px;background:var(--panel2)}
+.stats-tab{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:8px;min-height:42px;padding:7px 14px;border:0;border-radius:9px;background:transparent;color:var(--tx2);font:inherit;font-size:12.5px;cursor:pointer;transition:color .16s ease,background .16s ease,transform .16s ease}
+.stats-tab small{font-size:10px;font-weight:400;color:var(--tx3);transition:color .16s ease}
+.stats-tab:hover{color:var(--tx)}
+.stats-tab.on{background:var(--panel);color:var(--teal);box-shadow:0 1px 3px #00000012}
+.stats-tab.on small{color:var(--teal)}
+.stats-tab:active{transform:scale(.98)}
+.stats-tab:focus-visible{outline:2px solid var(--teal);outline-offset:-2px}
+.stats-panel{animation:stats-panel-enter .22s ease-out both}
+@keyframes stats-panel-enter{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+@media(max-width:700px){.stats-tabs{grid-template-columns:1fr}.stats-tab{justify-content:space-between}.stats-tab small{margin-left:auto}}
+@media(prefers-reduced-motion:reduce){.stats-tab,.stats-panel{transition:none;animation:none}}
+.publish-setup{margin-top:12px;padding-top:10px;border-top:1px solid var(--bd);color:var(--tx)}
+.publish-setup summary{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;font-weight:500;list-style:none}
+.publish-setup summary::-webkit-details-marker{display:none}
+.publish-setup summary::after{content:'展开';margin-left:12px;color:var(--tx3);font-size:11px;font-weight:400;white-space:nowrap}
+.publish-setup[open] summary::after{content:'收起'}
+/* ★ 2026-10-17：提醒条右侧的「未检查 / 检查完成」开关（用户自己确认，不读取得物开关）。
+   形状按 ReUI c-switch-3（shadcn Switch）的轨道 + 圆钮来做；本机渲染层是原生 HTML/CSS，
+   装不了 React 组件，所以按同一套外观/交互落地。 */
+.setup-switch{margin-left:auto;flex:none;display:inline-flex;align-items:center;gap:8px;border:0;background:none;padding:2px 0;font:inherit;font-size:11px;font-weight:600;line-height:1.6;white-space:nowrap;cursor:pointer;color:var(--red)}
+.setup-switch-track{position:relative;display:inline-flex;align-items:center;flex:none;width:36px;height:20px;border-radius:999px;background:var(--red);transition:background .15s}
+.setup-switch-thumb{position:absolute;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:transform .15s}
+.setup-switch.done{color:var(--teal)}
+.setup-switch.done .setup-switch-track{background:var(--teal)}
+.setup-switch.done .setup-switch-thumb{transform:translateX(16px)}
+.setup-switch:focus-visible{outline:2px solid var(--teal);outline-offset:2px;border-radius:6px}
+.publish-setup-icon{display:grid;place-items:center;width:18px;height:18px;flex:none;border-radius:50%;background:var(--teal-bg);color:var(--teal)}
+.publish-setup-brief{margin-left:12px;font-size:11px;font-weight:400;color:var(--tx3)}
+.publish-setup-items{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}
+.publish-setup-items>div{display:flex;flex-direction:column;align-items:flex-start;gap:7px;padding:12px;border-radius:8px;background:var(--bg)}
+.publish-setup-path{font-size:11px;color:var(--tx3)}
+.publish-setup-items strong{font-size:12px;font-weight:500;line-height:1.6}
+.publish-setup-off{font-size:11px;border-radius:5px;padding:3px 8px;background:var(--teal-bg);color:var(--teal)}
+.publish-setup p{margin:10px 0 0;font-size:11px;color:var(--tx3)}
+.publish-report{border-bottom:1px solid var(--bd);padding-bottom:16px;margin-bottom:16px}
+.device-probe{border-top:1px solid var(--bd);margin-top:10px;padding-top:10px}
+.skeleton-table{table-layout:fixed;width:100%;min-width:650px}
+.skeleton-table th,.skeleton-table td{height:44px;box-sizing:border-box;padding:10px 12px;line-height:24px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.skeleton-table th:nth-child(2),.skeleton-table td:nth-child(2){overflow:visible;text-overflow:clip}
+.update-available{color:var(--teal)!important;box-shadow:0 0 0 2px var(--teal-bg)}
+.release-page{max-width:1280px;margin:0 auto;color:var(--tx)}
+.release-date{display:flex;justify-content:space-between;margin:4px 0 18px;font-size:12px;color:var(--tx2)}
+.release-date span{font-size:11px;color:var(--teal)}
+.release-issue{background:var(--panel);border:1px solid var(--bd);border-radius:9px;overflow:hidden}
+.release-hero{padding:24px 30px 26px;background:linear-gradient(120deg,var(--teal-bg),var(--panel))}
+.release-kicker{font-size:10px;letter-spacing:3px;color:var(--teal)}
+.release-banner{position:relative;height:220px;margin:12px -15px 18px;overflow:hidden}
+.release-banner canvas{position:absolute;inset:0;width:100%;height:100%;color:var(--teal)}
+.release-brand{position:absolute;left:15px;top:50%;transform:translateY(-50%);font-family:Arial,"Helvetica Neue",sans-serif;font-size:56px;line-height:1;letter-spacing:8px;font-weight:400;z-index:1;background:transparent;padding:0;color:#213238}
+.release-brand>span{color:var(--teal)}
+.update-progress{margin:18px 0 12px;width:100%;color:var(--tx2)}
+.update-progress-heading{display:flex;justify-content:space-between;gap:12px;font-size:12px;font-weight:600;margin-bottom:7px}
+.update-progress-track{height:7px;border-radius:99px;background:#e9edf5;overflow:hidden}
+.update-progress-track>div{height:100%;background:#228451;border-radius:inherit;transition:width .2s ease}
+.update-progress-track.indeterminate>div{width:35%!important;animation:update-progress-slide 1.4s ease-in-out infinite}
+@keyframes update-progress-slide{from{transform:translateX(-100%)}to{transform:translateX(290%)}}
+@media(prefers-reduced-motion:reduce){.update-progress-track>div{transition:none}.update-progress-track.indeterminate>div{animation-duration:3s}}
+/* 反馈弹窗独立排版，避免沿用无内边距的旧模态容器。 */
+#feedbackModal{background:rgba(18,30,28,.32);backdrop-filter:blur(3px)}
+.feedback-dialog{box-sizing:border-box;width:min(520px,calc(100vw - 40px));max-height:calc(100vh - 48px);overflow:auto;padding:28px;background:var(--panel);color:var(--tx);border:1px solid var(--bd);border-radius:18px;box-shadow:0 24px 80px rgba(0,0,0,.18)}
+.feedback-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}
+.feedback-eyebrow{font-size:11px;letter-spacing:2px;color:var(--teal)}
+.feedback-heading h3{margin:7px 0 0;font-size:22px;line-height:1.3;font-weight:600}
+.feedback-dismiss{width:30px;height:30px;display:grid;place-items:center;border:0;border-radius:50%;background:var(--panel2);color:var(--tx2);font-size:22px;cursor:pointer}
+.feedback-dismiss:hover{background:var(--bd)}
+.feedback-description{margin:15px 0 24px;color:var(--tx2);font-size:12px;line-height:1.7}
+.feedback-label{display:block;margin-bottom:9px;font-size:12px;font-weight:600}
+#feedbackText{box-sizing:border-box;width:100%;min-height:148px;max-height:280px;resize:vertical;padding:13px 14px;border-radius:10px;line-height:1.8;background:var(--panel2)}
+#feedbackText:focus{outline:none;border-color:var(--teal);box-shadow:0 0 0 3px rgba(16,115,93,.09)}
+.feedback-note{margin:9px 0 0;font-size:11px;color:var(--tx2)}
+#feedbackMessage:empty{display:none}
+.feedback-footer{display:flex;justify-content:flex-end;gap:10px;margin-top:24px;padding-top:18px;border-top:1px solid var(--bd)}
+.feedback-footer .btn{min-width:74px;height:35px;border-radius:8px}
+.release-fallback{position:absolute;right:18%;top:30px;font:900 160px Arial;color:var(--teal);opacity:.1;pointer-events:none}
+.release-banner:has(canvas[data-ready]) .release-fallback{display:none}
+.release-hero h2{font-size:21px;margin:0 0 12px;letter-spacing:.3px}
+.release-hero p{font-size:12px;line-height:1.9;color:var(--tx2);margin:0}
+.release-section{margin:0 30px;padding:26px 0;border-bottom:1px solid var(--bd)}
+.release-section:last-child{border-bottom:0}
+.release-section h3{font-size:17px;margin:0 0 10px;display:flex;gap:10px;align-items:baseline}
+.release-section h3 em{font-size:11px;color:var(--teal);font-style:normal;font-variant-numeric:tabular-nums}
+.release-muted,.release-footnote{font-size:11px;color:var(--tx3);line-height:1.9;margin:0}
+.release-pipeline{position:relative;margin:14px 0 2px;padding-top:32px}
+.release-pipeline>svg{position:absolute;top:0;left:0;width:100%;height:60px;overflow:visible;fill:none;stroke:var(--teal);stroke-width:1}
+.release-track{opacity:.25}
+.release-flow{stroke-width:2;stroke-dasharray:32 88;animation:release-flow 4s linear infinite}
+.release-pipeline ol{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:20px;list-style:none;padding:0;margin:0}
+.release-station{display:grid;place-items:center;width:14px;height:14px;background:var(--panel);border:1px solid var(--teal);border-radius:50%;font-size:8px;color:var(--teal);animation:release-node 5s ease-in-out infinite;animation-delay:calc(var(--stage)*1s);position:relative;top:-9px}
+.release-pipeline h4{font-size:13px;margin:2px 0 8px}
+.release-pipeline b{font-size:10px;font-weight:500;color:var(--teal)}
+.release-pipeline p{font-size:11px;line-height:1.8;color:var(--tx2);margin:8px 0 0}
+.release-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:25px;margin:24px 0}
+.release-metrics span{font-size:10px;color:var(--tx2)}
+.release-metrics strong{display:block;font-size:34px;font-weight:500;letter-spacing:-1px;margin:10px 0;color:var(--teal);font-variant-numeric:tabular-nums}
+.release-metrics small{font-size:12px;letter-spacing:0;margin-left:5px;color:var(--tx3)}
+.release-metrics p{font-size:10px;color:var(--tx3);margin:0}
+.release-bars{display:grid;gap:12px;margin:18px 0;font-size:10px;color:var(--tx2)}
+.release-bars span{position:relative;padding:5px 10px;isolation:isolate}
+.release-bars i{position:absolute;inset:0 auto 0 0;width:var(--bar);background:var(--teal-bg);border-left:2px solid var(--teal);z-index:-1;animation:release-bar 1.1s ease-out both;transform-origin:left}
+.release-changes{list-style:none;margin:16px 0 0;padding:0;display:grid;gap:16px}
+.release-changes li{display:grid;grid-template-columns:100px 1fr;gap:12px;font-size:12px;line-height:1.8}
+.release-changes b{font-weight:500}.release-changes span{color:var(--tx2)}
+@keyframes release-flow{to{stroke-dashoffset:-464}}
+@keyframes release-node{0%,18%,100%{box-shadow:0 0 0 0 transparent}9%{box-shadow:0 0 0 5px var(--teal-bg);background:var(--teal);color:var(--panel)}}
+@keyframes release-bar{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+@media(max-width:900px){.release-hero{padding:22px}.release-section{margin:0 22px}.release-pipeline ol{gap:12px}.release-banner{height:190px}.release-brand{font-size:44px;letter-spacing:6px}}
+/* 用户要求更新日志保持动态展示；系统减少动态效果时降低速度。 */
+@media(prefers-reduced-motion:reduce){.release-flow{animation-duration:8s}.release-station{animation-duration:10s}.release-bars i{animation:none}}
+.nav.has-update,.nav.has-update.on{color:#a855ff}
+.nav.has-update::after{content:'';width:6px;height:6px;border-radius:50%;background:#a855ff;flex:0 0 6px;margin-left:auto}
+.changelog-layout{display:grid;grid-template-columns:minmax(0,1fr) 200px;gap:24px;max-width:1200px;margin:0 auto}
+.changelog-hero{padding:28px;background:var(--teal-bg);border-radius:12px}
+.changelog-hero strong{display:block;font-size:48px;line-height:1.3;color:var(--teal);margin:12px 0}
+.changelog-hero p{font-size:14px;line-height:1.8;color:var(--tx2)}
+.changelog-date{margin:24px 0 4px;color:var(--tx3);font-size:12px}
+.changelog-entry{padding:20px 0;border-bottom:1px solid var(--bd)}
+.changelog-kind{font-size:11px;color:var(--teal);letter-spacing:2px}
+.changelog-entry h3{margin:8px 0;font-size:15px}
+.changelog-entry p{margin:0;color:var(--tx2);line-height:1.9;font-size:12px}
+.changelog-side{align-self:start;position:sticky;top:0}
+.changelog-filter{display:flex;justify-content:space-between;width:100%;border:0;background:transparent;color:var(--tx2);padding:9px 10px;border-radius:6px;cursor:pointer;font:inherit;font-size:12px}
+.changelog-filter.on,.changelog-filter:hover{background:var(--teal-bg);color:var(--teal)}
+.changelog-hero{position:relative;overflow:hidden;border:1px solid var(--bd);padding:30px 32px 22px;background:linear-gradient(125deg,var(--panel),var(--teal-bg))}
+.changelog-eyebrow{position:relative;z-index:1;display:flex;align-items:center;gap:8px;font-size:10px;letter-spacing:2px;color:var(--teal)}
+.changelog-eyebrow>span{width:18px;height:1px;background:currentColor}
+.changelog-art{position:absolute;width:65%;height:100%;right:-12%;top:0;color:var(--teal);opacity:.7;pointer-events:none}
+.changelog-version{position:relative;display:flex;align-items:baseline;gap:14px;margin:20px 0 16px}
+.changelog-version strong{font-size:76px;line-height:1;margin:0;font-weight:600;letter-spacing:-5px;font-variant-numeric:tabular-nums}
+.changelog-version>span{font-size:10px;color:var(--teal);border:1px solid var(--teal);border-radius:20px;padding:3px 8px;letter-spacing:1px}
+.changelog-hero h2{position:relative;font-size:22px;font-weight:600;letter-spacing:.5px;margin:0 0 10px}
+.changelog-hero p{position:relative;font-size:12px;line-height:1.9;margin:0 0 24px;max-width:360px}
+.changelog-hero-foot{position:relative;display:flex;justify-content:space-between;gap:12px;border-top:1px solid var(--bd);padding-top:14px;font-size:10px;color:var(--tx3);letter-spacing:1px}
+.changelog-hero-foot i{margin:0 6px;font-style:normal}
+.changelog-section-head{display:flex;align-items:center;justify-content:space-between;margin:28px 0 8px}
+.changelog-section-head .changelog-date{margin:0;color:var(--tx2);font-weight:600}
+.changelog-section-head>span{font-size:10px;color:var(--tx3)}
+.changelog-timeline{margin-left:5px;border-left:1px solid var(--bd)}
+.changelog-entry{position:relative;margin-left:22px;padding:20px 0 22px;animation:release-enter .35s ease-out both;animation-delay:var(--entry-delay)}
+.changelog-node{position:absolute;left:-27px;top:25px;width:9px;height:9px;box-sizing:border-box;border-radius:50%;border:2px solid var(--teal);background:var(--panel);transition:box-shadow .2s}
+.changelog-entry:hover .changelog-node{box-shadow:0 0 0 4px var(--teal-bg)}
+.changelog-entry-meta{display:flex;align-items:center;justify-content:space-between}
+.changelog-kind{font-size:10px;letter-spacing:1px;border-radius:4px;background:var(--teal-bg);padding:3px 7px}
+.changelog-kind[data-kind="修复"]{color:var(--amber);background:var(--panel)}
+.changelog-kind[data-kind="调整"]{color:var(--tx3);background:var(--bg)}
+.changelog-number{font-size:10px;font-variant-numeric:tabular-nums;color:var(--tx3)}
+.changelog-side .box{padding:16px;margin-bottom:12px;border-radius:10px}
+.changelog-side h3{font-size:12px;margin-bottom:12px}
+.changelog-side p{font-size:11px;color:var(--tx2);line-height:1.8}
+.changelog-filter{transition:background .16s,color .16s}
+.changelog-filter>span:first-child{display:flex;align-items:center;gap:8px}
+.changelog-filter i{width:4px;height:4px;border-radius:50%;background:currentColor;opacity:.7}
+.changelog-filter>span:last-child{font-size:10px;color:var(--tx3);font-variant-numeric:tabular-nums}
+.changelog-note{padding:16px;color:var(--tx3)}
+.changelog-note svg{width:24px;height:24px;fill:none;stroke:var(--teal);stroke-width:1.2;margin-bottom:14px}
+.changelog-note h3{font-size:11px;color:var(--tx2);margin:0 0 8px}
+.changelog-note p{margin:0;font-size:11px;line-height:1.9}
+.changelog-orbit{animation:release-breathe 4s ease-in-out infinite}
+/* 更新日志采用日期卡片与时间侧栏，跟随当前主题。
+   ★ 2026-10-17 用户截图：窗口一宽，左右各空一大块。更新日志不该被固定宽度居中，
+   和上面的更新卡片一样占满内容区；去掉 max-width，只保留上下间距。 */
+.release-journal{margin:22px 0 40px;display:grid;gap:22px}
+.journal-day{background:var(--panel);border:1px solid var(--bd);border-radius:16px;padding:28px 32px;box-shadow:0 1px 3px #00000005}
+.journal-date{display:flex;align-items:baseline;gap:16px;border-bottom:1px solid var(--bd);padding-bottom:22px;margin-bottom:26px}
+.journal-date h2{margin:0;font-size:25px;letter-spacing:.5px;line-height:1.5}
+.journal-date>span{color:var(--tx3);font-size:15px}
+.journal-entry{display:grid;grid-template-columns:136px minmax(0,1fr);padding:0 0 28px}
+.journal-entry:last-child{padding-bottom:0}
+.journal-meta{display:flex;flex-direction:column;gap:14px;color:var(--tx2);font-size:13px;padding:4px 24px 0 0;font-variant-numeric:tabular-nums}
+.journal-kind{display:flex;align-items:center;gap:8px}
+.journal-kind::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--teal)}
+.journal-kind[data-kind="修复"]::before{background:var(--amber)}
+.journal-body{border-left:1px solid var(--bd);padding-left:32px;min-width:0}
+.journal-body h3{font-size:19px;line-height:1.6;margin:0 0 12px;font-weight:700}
+.journal-body p,.journal-body li{font-size:15px;line-height:1.95;color:var(--tx2);overflow-wrap:anywhere}
+.journal-body p{margin:0 0 12px}.journal-body ul{margin:0;padding-left:19px}.journal-body li+li{margin-top:7px}.journal-body strong{color:var(--tx)}
+.journal-item+.journal-item{border-top:1px solid var(--bd);margin-top:22px;padding-top:22px}
+@media(max-width:850px){.journal-day{padding:22px}.journal-date h2{font-size:21px}.journal-entry{grid-template-columns:100px minmax(0,1fr)}.journal-body{padding-left:22px}.journal-body h3{font-size:17px}.journal-body p,.journal-body li{font-size:14px}}
+@media(max-width:560px){.journal-date{gap:10px}.journal-date h2{font-size:18px}.journal-entry{display:block}.journal-meta{flex-direction:row;padding:0;margin-bottom:12px}.journal-body{border-left:0;padding-left:0}}
+@keyframes release-enter{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
+@keyframes release-breathe{50%{opacity:.25}}
+@media(prefers-reduced-motion:reduce){.changelog-entry,.changelog-orbit{animation:none}.changelog-filter,.changelog-node{transition:none}}
+@media(max-width:850px){.changelog-layout{grid-template-columns:1fr}.changelog-side{position:static;grid-row:1}.changelog-side .box:last-child{display:none}.changelog-side .box:first-child{display:flex;align-items:center;gap:4px}.changelog-side h3{white-space:nowrap;margin:0 8px 0 0}.changelog-filter{width:auto;gap:8px}.changelog-hero{padding:20px}}

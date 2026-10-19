@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'">
+<title>得物蓝V素材发布工具</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body class="locked">
+<div class="app" hidden inert>
+
+  <div class="titlebar">
+    <div class="tb-left">
+      <span class="logo" id="logo" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="17" height="17">
+          <rect width="32" height="32" rx="7" fill="#0f6e56"/>
+          <path d="M9.5 10l6.5 13 6.5-13" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </span>
+      <span class="name">得物蓝V素材发布工具</span>
+      <!-- 当前版本号用于识别安装版本。 -->
+      <button class="chip chip-ver" id="appVer" data-act="update:open" title="当前版本 · 点击检查更新">v—</button>
+    </div>
+    <div class="tb-drag"></div>
+    <div class="tb-right">
+      <div class="chips">
+        <!-- 主题切换：用户要求「放在 app 最上面、项目左边，点击即可切换」。
+             app 默认浅色；「跟随 Windows 设置」这一档已取消（老配置里的 system 也按浅色算）。
+             ★ 2026-10-08 起是三档（日间 / 夜间 / 玻璃），且**改成 Dock**：
+               三个图标常驻，指针靠近时**按距离弹簧放大**（用户要求「做成 Spring dock 那种」）。
+             ★ 这里**只有三个图标** —— 不加文字、不加「当前：X」这类状态芯片（用户明确不要）。
+             ★ 语义变了：**不再是单键循环**，点哪个图标就直接切到哪一档（data-skin = 目标档位）。
+               点击走通用分发器 → ACTS['theme:set']（app.js），落盘仍是同一套 theme:set IPC。
+             ★ 放大逻辑在 app.js 的 bindThemeDock()（距离→目标缩放 + 弹簧积分，非 CSS transition）；
+               这里只负责结构与语义，样式见 styles.css 的 .theme-dock。 -->
+        <div class="theme-dock" id="themeDock" role="group" aria-label="切换 日间 / 夜间 / 玻璃">
+          <button class="tdock" data-act="theme:set" data-skin="light" title="日间" aria-pressed="false">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.1"/><path d="M12 2.2v2.5M12 19.3v2.5M2.2 12h2.5M19.3 12h2.5M5.1 5.1l1.8 1.8M17.1 17.1l1.8 1.8M18.9 5.1l-1.8 1.8M6.9 17.1l-1.8 1.8"/></svg>
+          </button>
+          <button class="tdock" data-act="theme:set" data-skin="dark" title="夜间" aria-pressed="false">
+            <svg viewBox="0 0 24 24"><path d="M20.4 14.6A8.6 8.6 0 1 1 9.4 3.6a6.9 6.9 0 0 0 11 11z"/></svg>
+          </button>
+          <button class="tdock" data-act="theme:set" data-skin="glass" title="玻璃" aria-pressed="false">
+            <svg viewBox="0 0 24 24"><path d="M12 3.2c-3.1 3.9-5.4 6.9-5.4 9.4a5.4 5.4 0 0 0 10.8 0c0-2.5-2.3-5.5-5.4-9.4z"/></svg>
+          </button>
+        </div>
+        <!-- 当前品牌：文案生成 / 发布单 / 发布 都归属到它。放在标题栏是为了让人随时看得见，
+             不然「忘了选品牌」会变成一条查不到归属的发布记录 -->
+        <select class="chip chip-sel" id="brandSel" title="当前品牌：文案生成 / 发布单 / 发布都会归属到它"></select>
+        <span class="chip" id="runChip">空闲</span>
+        <span class="chip chip-user" id="chipUser" title="当前登录账号">未登录</span>
+        <button class="tbbtn" id="btnLogout" title="退出登录">退出</button>
+      </div>
+      <div class="cap">
+        <button id="capMin" title="最小化" aria-label="最小化">
+          <svg viewBox="0 0 10 10"><path d="M0 5h10"/></svg>
+        </button>
+        <button id="capMax" class="max" title="最大化" aria-label="最大化">
+          <svg viewBox="0 0 10 10" id="capMaxIcon"><rect x=".7" y=".7" width="8.6" height="8.6" rx="1"/></svg>
+        </button>
+        <button id="capClose" class="close" title="关闭" aria-label="关闭">
+          <svg viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div class="body">
+    <nav class="side" id="side">
+      <div class="grp">生产</div>
+      <button class="nav" data-tab="1">
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/><path d="M3 7V6a2 2 0 0 1 2-2h4l2 2"/></svg></span>
+        <span>素材整理</span>
+      </button>
+      <button class="nav" data-tab="2">
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.2-2.9 7.7-7 9-4.1-1.3-7-4.8-7-9V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg></span>
+        <span>合规检查</span>
+      </button>
+      <button class="nav" data-tab="3">
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="M4 20h4l10-10a2.8 2.8 0 0 0-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/></svg></span>
+        <span>文案生成</span>
+      </button>
+      <!-- 热词库：标题「产品词 + 热门词」用的那份词库，**单开一屏** ——
+           它是低频维护、生成是高频动作，混一屏既容易误触生成、跑生成时又被词表挡路。
+           2026-10-03 按用户要求从「其他」组末尾移到生成相关内容旁边。
+           ★ 只挪 DOM 位置、**编号仍是 12 不重排** —— 重排要把 6~12 全改号，
+             连带 Ctrl+1..9、跳页写法与测试断言都得动，为一个位置改动不划算。
+           所有登录成员可编辑本机词库；各台电脑独立保存，不向其他电脑同步。 -->
+      <button class="nav" data-tab="12">
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="M20 12.5l-7.5 7.5L4 11.5V4h7.5L20 12.5z"/><circle cx="8.6" cy="8.6" r="1.5"/></svg></span>
+        <span>本地词库</span>
+      </button>
+      <!-- 「发布单」页签 2026-10-03 按用户要求删除：那一页只是个 xlsx 路径 + 12 行预览 + 4 个按钮，
+           和本页（模拟器发布）高度重复。导出 xlsx / 打开文件 / 打开目录已挪到本页「装置与节奏」那一块。
+           编号留空（不重排）：重排要把 6~12 全改成 5~11，连带 Ctrl+1..9、跳页写法与测试断言都得动。 -->
+      <div class="grp">执行</div>
+      <button class="nav" data-tab="6">
+        <span class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10.5 8.8l5 3.2-5 3.2V8.8z"/></svg></span>
+        <span>模拟器发布</span>
+      </button>
+      <!-- 运行日志：内容和最下面那条日志栏是**同一份**（app.js 里的 state.logs），
+           单独开一页只是为了能筛、能导。编号接在最后（10）而不是插成 7：
+           插进去要把设置/品牌统计/品牌与权限改成 8/9/10，连带 Ctrl+1..9、跳页写法与测试断言都得动。
+           ★ 2026-10-05 用户：「左侧日志模块不要显示有多少条」⇒ 原来这个位置上的角标
+             （`<span class="st" data-st="10">`，会显示「3 条」「1 错」）整个去掉了，不再加回来 ——
+             条数只在页面里（页内 chip）和底部日志栏右上角看。 -->
+      <button class="nav" data-tab="10">
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="M5 4h9l5 5v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M14 4v5h5M8 13h8M8 16.5h5"/></svg></span>
+        <span>运行日志</span>
+      </button>
+      <!-- 备用入口试发：**只给指定账号（shuo）**用的测试模块，见 app.js 的 fallbackTestVisible()。
+           为什么要单开一页而不是往「模拟器发布」里塞按钮：那一页是日常发布入口，
+           多一个「强制走备用入口」的开关迟早会被人误点成正式发布。
+           编号接在最后（14）而不是插进「执行」组：插号要把已有的 6~13 全改一遍，
+           连带 Ctrl+N、跳页写法与一批测试断言都要跟着动，为一个隐藏页签不划算。
+           默认 hidden：不能靠渲染层「记得隐藏」——服务端（主进程）那边另有一道拒绝。 -->
+      <button class="nav" data-tab="14" data-fallback-test="1" hidden>
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="M4 7h3l2-2h6l2 2h3v12H4z"/><circle cx="12" cy="13" r="3.6"/></svg></span>
+        <span>备用入口试发</span>
+      </button>
+      <div class="grp">其他</div>
+      <button class="nav" data-tab="7">
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="m9.5 3-.7 2.4-2 .9-2.3-.6-2 3.5 1.7 1.8v2l-1.7 1.8 2 3.5 2.3-.6 2 .9.7 2.4h4.9l.7-2.4 2-.9 2.3.6 2-3.5-1.7-1.8v-2l1.7-1.8-2-3.5-2.3.6-2-.9-.7-2.4z"/><circle cx="12" cy="12" r="3"/></svg></span>
+        <span>设置</span>
+      </button>
+      <!-- 编号接在最后而不是插进「执行」组：插进去要把设置从 7 改成 8，
+           连带 Ctrl+1..7 快捷键、app.js 里跳设置页的写法、几处测试断言都要跟着动，
+           为一个新页签改号不划算 -->
+      <button class="nav" data-tab="8">
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="M3 21h18"/><rect x="5" y="12" width="3.4" height="6" rx="1"/><rect x="10.3" y="7" width="3.4" height="11" rx="1"/><rect x="15.6" y="14" width="3.4" height="4" rx="1"/></svg></span>
+        <span>品牌统计</span>
+      </button>
+      <!-- 品牌与权限：原先挤在「设置」页最下面（路径、模型、品牌、账号混在一屏），
+           2026-10-01 按用户要求拆成独立一页。同样接在最后，不动已有编号 -->
+      <button class="nav" data-tab="9" data-admin="1" hidden>
+        <span class="ic"><svg viewBox="0 0 24 24"><circle cx="8.2" cy="12" r="4"/><path d="M12.2 12h8.4M17.6 12v3.2M14.9 12v2.4"/></svg></span>
+        <span>品牌与权限</span>
+      </button>
+      <!-- 高级设置：装一次就不再动的配置（UI 定位表 / 货号颜色接口 /
+           adb、ffmpeg 路径）。★ 2026-10-08 起「文案模型」不在这儿了 —— 搬到「文案生成 → 模型配置」弹窗。
+           data-admin="1" ⇒ 非管理员整个按钮都不显示（见 app.js syncAdminNav）。
+           编号接在最后（11）：插进中间要改一堆已有编号、快捷键与测试断言，为一个新页签不划算 -->
+      <button class="nav" data-tab="11" data-admin="1">
+        <span class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.1"/><path d="M12 3.6v2.2M12 18.2v2.2M5.4 7.4l1.9 1.1M16.7 15.5l1.9 1.1M5.4 16.6l1.9-1.1M16.7 8.5l1.9-1.1"/></svg></span>
+        <span>高级设置</span>
+      </button>
+      <button class="nav" data-tab="13">
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="M3 11a9 9 0 1 1 3 8M3 5v6h6M12 7v5l3 2"/></svg></span>
+        <span>更新日志</span>
+      </button>
+      <button class="folder-tool-link" type="button" data-act="folderTool:open" data-url="https://material-folder-generator.pages.dev/">
+        <span class="ic"><svg viewBox="0 0 24 24"><path d="M3 7h7l2 2h9v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/><path d="M3 7V6a2 2 0 0 1 2-2h4l2 2"/></svg></span>
+        <span class="folder-tool-text">文件夹工具</span>
+      </button>
+    </nav>
+
+    <div class="main">
+      <div class="head" id="head"></div>
+      <section class="pane" id="pane"></section>
+    </div>
+  </div>
+
+  <div class="logbar">
+    <div class="lt">
+      <span>运行日志</span>
+      <span class="grow"></span>
+      <!-- 条数：与左侧「运行日志」页同一个口径（内存缓冲区，上限 500 条）。
+           2026-10-03 用户：右边不显示有多少条 -->
+    </div>
+    <div class="lines" id="log"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- 品牌 / 文案提示词的弹窗。挂在 .app 外面：要盖住标题栏和日志条，
+     塞进 .body 里会被它的 overflow 裁掉，底部按钮就点不到了 -->
+<div class="modal" id="bmodal" hidden>
+  <div class="mbox" id="bmBox"></div>
+</div>
+
+<!-- 账号操作弹窗（配置品牌权限 / 重置密码）。跟上面那个一样挂在 .app 外面，
+     塞进 .body 里会被它的 overflow 裁掉；内容少，用窄一档的 .mbox-sm -->
+<div class="modal" id="umodal" hidden>
+  <div class="mbox mbox-sm" id="umBox"></div>
+</div>
+
+<!-- 「说明书」弹窗（2026-10-03 用户要求）：批次设置那种六百多字的长规则，别全铺在页面上 ——
+     页面只留一行结论 + 一个「看说明书」，细节点开再看。
+     ★ 内容长度不定 ⇒ 用标准的 .mbox，并在里面套 .mh / .mb（.mb 才有 overflow:auto，
+       直接往 .mbox 里灌长内容会被 overflow:hidden 裁掉、还滚不动）。 -->
+<div class="modal" id="hmodal" hidden>
+  <div class="mbox" id="hmBox"></div>
+</div>
+
+<!-- 「模型配置」弹窗（2026-10-08 用户要求）：原来在「高级设置 → 文案模型」里，搬到「文案生成」页做成弹窗，
+     并且成为**唯一**的模型配置入口（高级设置里那一整块已删）。
+     同上面几个：挂在 .app 外面才盖得住标题栏；内容是一张表单，用窄一档的 .mbox-sm。 -->
+<div class="modal" id="lmmodal" hidden>
+  <div class="mbox mbox-sm" id="lmBox"></div>
+</div>
+
+<div class="gate" id="gate">
+  <form class="gcard" id="loginForm" autocomplete="off">
+    <!-- 无边框小窗的关闭口：做在卡片内部右上角，不许浮到卡片边框外面去 -->
+    <button class="gx" id="gateClose" type="button" title="关闭" aria-label="关闭">
+      <svg viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10"/></svg>
+    </button>
+    <div class="gbrand">
+      <span class="glogo" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="26" height="26">
+          <rect width="32" height="32" rx="7" fill="#0f6e56"/>
+          <path d="M9.5 10l6.5 13 6.5-13" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </span>
+      <div>
+        <div class="gname">得物蓝V素材发布工具</div>
+        <div class="gsub">请输入账号密码进入</div>
+      </div>
+    </div>
+
+    <label class="gfld">
+      <span>账号</span>
+      <input class="inp" id="lgUser" autocomplete="off" spellcheck="false" autocapitalize="off">
+    </label>
+    <label class="gfld">
+      <span>密码</span>
+      <span class="password-group">
+        <input class="inp" id="lgPwd" type="password" autocomplete="off">
+        <button class="password-toggle" id="lgPwdToggle" type="button" aria-controls="lgPwd" aria-label="显示密码" aria-pressed="false" title="显示密码">
+          <svg class="password-eye" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.7"/></svg>
+        </button>
+      </span>
+    </label>
+
+    <label class="grem"><input type="checkbox" id="lgRem" checked> 记住登录状态（本机 7 天内免登录）</label>
+
+    <div class="gerr" id="lgErr"></div>
+
+    <button class="btn primary ggo" id="lgGo" type="submit">登 录</button>
+  </form>
+  <form class="gcard" id="bootstrapForm" autocomplete="off" hidden>
+    <button class="gx" id="bootstrapClose" type="button" title="关闭" aria-label="关闭">
+      <svg viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10"/></svg>
+    </button>
+    <div class="gbrand">
+      <span class="glogo" aria-hidden="true"><svg viewBox="0 0 32 32" width="26" height="26"><rect width="32" height="32" rx="7" fill="#0f6e56"/><path d="M9.5 10l6.5 13 6.5-13" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <div><div class="gname">初始化云端管理员</div><div class="gsub">仅首次设置一次，之后成员可在其他电脑登录</div></div>
+    </div>
+    <label class="gfld"><span>一次性初始化码（从 Supabase SQL Editor 运行结果复制）</span><input class="inp" id="lgSetupCode" autocomplete="off" spellcheck="false"></label>
+    <label class="gfld"><span>管理员账号</span><input class="inp" id="lgSetupUser" autocomplete="off" spellcheck="false" autocapitalize="off"></label>
+    <label class="gfld"><span>管理员密码（至少 6 位）</span><input class="inp" id="lgSetupPwd" type="password" autocomplete="new-password"></label>
+    <label class="gfld"><span>显示名称</span><input class="inp" id="lgSetupName" autocomplete="off"></label>
+    <label class="grem"><input type="checkbox" id="lgSetupRem" checked> 记住登录状态（本机 7 天内免登录）</label>
+    <div class="gerr" id="lgSetupErr"></div>
+    <button class="btn primary ggo" id="lgSetupGo" type="submit">创建云端管理员</button>
+  </form>
+  <div class="gcard gloading" id="gateLoading" hidden>
+    <button class="gx" id="loadingClose" type="button" title="关闭" aria-label="关闭">
+      <svg viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10"/></svg>
+    </button>
+    <div class="gname">得物蓝V素材发布工具</div>
+    <div class="gate-wave" role="status" aria-label="正在加载">
+      <i class="gate-wave-bar" style="--wave-level:0"></i><i class="gate-wave-bar" style="--wave-level:1"></i><i class="gate-wave-bar" style="--wave-level:2"></i><i class="gate-wave-bar" style="--wave-level:3"></i><i class="gate-wave-bar" style="--wave-level:4"></i><i class="gate-wave-bar" style="--wave-level:3"></i><i class="gate-wave-bar" style="--wave-level:2"></i><i class="gate-wave-bar" style="--wave-level:1"></i><i class="gate-wave-bar" style="--wave-level:0"></i>
+    </div>
+    <p class="gsub">正在加载，请稍候…</p>
+  </div>
+</div>
+
+<script src="password-toggle.js"></script>
+<script src="release-motion.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,98 @@
+{
+  "name": "dewu-bluev-publisher-oss",
+  "version": "1.1.2",
+  "description": "Windows desktop publishing workflow community edition",
+  "main": "src/main/index.js",
+  "author": "BlueV community contributors",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "check": "node tools/opensource-check.cjs",
+    "test": "node tools/securitytest.js && node tools/cloudauth-test.js && node tools/sqlauth-securitytest.js && node tools/opensource-sync-test.cjs",
+    "dist:win": "electron-builder --win --x64 --publish never"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "exceljs": "^4.4.0",
+    "heic-decode": "^2.1.0",
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0"
+  },
+  "optionalDependencies": {
+    "sharp": "0.35.5"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
+    "cos-nodejs-sdk-v5": "^3.0.0",
+    "electron": "44.7.0",
+    "electron-builder": "26.15.3"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    },
+    "@electron/get": "5.1.0"
+  },
+  "build": {
+    "appId": "org.bluev.community.publisher",
+    "productName": "BlueV Community Publisher",
+    "copyright": "Copyright © 2026",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "!**/*.map",
+      "!node_modules/exceljs/dist/**/*",
+      "!node_modules/exceljs/README*",
+      "!**/@img/sharp-darwin-*/**",
+      "!**/@img/sharp-linux-*/**",
+      "!**/@img/sharp-libvips-darwin-*/**",
+      "!**/@img/sharp-libvips-linux-*/**",
+      "!**/@img/sharp-libvips-linuxmusl-*/**"
+    ],
+    "asar": true,
+    "npmRebuild": false,
+    "asarUnpack": [
+      "**/*.node",
+      "**/sharp/**/*",
+      "**/@img/**/*"
+    ],
+    "extraResources": [],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "${productName}-${version}-${arch}-win.${ext}",
+      "legalTrademarks": "得物蓝V素材发布工具"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BlueV Community Publisher",
+      "language": "2052",
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": [
+        "zh_CN"
+      ]
+    },
+    "compression": "maximum",
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ]
+  }
+}

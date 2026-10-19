@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "sourcePrefixes": ["src/"],
+  "sourceFiles": ["build/icon.ico", "build/icon.png", "tools/securitytest.js", "tools/sqlauth-securitytest.js", "tools/cloudauth-test.js", "tools/test-runtime.js", "docs/supabase-auth-migration.sql", "docs/supabase-auth-security-migration.sql"],
+  "protected": ["src/main/llmdefaults.js", "src/main/clouddefaults.js", "src/main/githubupdates.js"],
+  "groups": ["publishing", "ui", "foundation", "tests", "backend", "all"],
+  "publishingFiles": ["src/main/uimapdefaults.js"],
+  "publishingPrefixes": ["src/main/services/"],
+  "sensitiveFilesExcluded": [".env", "config.json", "auth.json", "project.json", ".git-credentials"],
+  "note": "单向、人工选择、默认预览；不会自动推送。内部文档、发布脚本、业务日志、二进制依赖和原 Git 历史均不导出。"
+}
