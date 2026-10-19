@@ -3,7 +3,9 @@
 const fs = require('fs'), path = require('path'), cp = require('child_process'), crypto = require('crypto');
 const root = path.resolve(__dirname, '..');
 const policy = JSON.parse(fs.readFileSync(path.join(root, 'opensource/sync-policy.json'), 'utf8'));
-const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+const rawHash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+// Git 在 Windows 检出时可能转换换行；摘要忽略文本换行差异，二进制保持逐字节。
+const hash = bytes => rawHash(bytes.includes(0) ? bytes : Buffer.from(bytes.toString('utf8').replace(/\r\n/g, '\n')));
 const git = (source, args) => cp.execFileSync('git', ['-C', source, ...args], { maxBuffer: 32 * 1024 * 1024, windowsHide: true });
 const normalize = file => file.replace(/\\/g, '/');
 function groupOf(file) {
@@ -119,7 +121,7 @@ function sync({ source, target, group = 'all', apply = false }) {
     const full = safePath(target, file), exists = fs.existsSync(full), actual = exists ? hash(fs.readFileSync(full)) : null;
     const wanted = hash(bytes), old = previous.files[file];
     if (actual !== wanted) {
-      if (exists && (!old || actual !== old.sha256)) conflicts.push(file);
+      if (exists && (!old || (actual !== old.sha256 && rawHash(fs.readFileSync(full)) !== old.sha256))) conflicts.push(file);
       changes.push({ action: exists ? 'update' : 'add', file });
     }
     next[file] = { sha256: wanted, sourceRevision: revision, group: groupOf(file), origin: upstreamFiles.has(file) ? 'upstream' : 'overlay' };
@@ -129,7 +131,8 @@ function sync({ source, target, group = 'all', apply = false }) {
     if (files.has(file) || (group !== 'all' && old.group !== group)) continue;
     const full = safePath(target, file);
     if (!fs.existsSync(full)) { delete next[file]; continue; }
-    if (hash(fs.readFileSync(full)) !== old.sha256) conflicts.push(file);
+    const bytes = fs.readFileSync(full);
+    if (hash(bytes) !== old.sha256 && rawHash(bytes) !== old.sha256) conflicts.push(file);
     changes.push({ action: 'delete', file }); delete next[file];
   }
   // 应用前检查整个现有公开目录，而不只检查本次选择的代码。

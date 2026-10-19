@@ -524,7 +524,7 @@
       "origin": "overlay"
     },
     "tools/opensource-sync.cjs": {
-      "sha256": "ca4ff6958ba324ca5c4217bdf16beeb436a7bd006a1cae59aef55780a1611cc8",
+      "sha256": "e148f5df480d63d71790857ecabf95e7e395954c32faf29ae36eb34b2dca0379",
       "sourceRevision": "6bbf5aa832e026d0a6c22b10ca0ed8d04e0976d4",
       "group": "tests",
       "origin": "overlay"
@@ -596,7 +596,7 @@
       "origin": "overlay"
     },
     "tools/opensource-sync-test.cjs": {
-      "sha256": "20351679c652211003dd5fcc5394c97500dc9b902090742715ea1a2bd46ad653",
+      "sha256": "d40dcd0b7fb51f363c36e6652a2a7d8e8b0f34b4241c88738549ff142dec5bcc",
       "sourceRevision": "6bbf5aa832e026d0a6c22b10ca0ed8d04e0976d4",
       "group": "tests",
       "origin": "overlay"
